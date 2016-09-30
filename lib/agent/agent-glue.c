@@ -2,6 +2,8 @@
 
 #include "frida-agent.h"
 
+#include "valgrind.h"
+
 #ifndef G_OS_WIN32
 # include <frida-interfaces.h>
 #endif
@@ -66,6 +68,7 @@ static void * frida_linker_stub_warmup_thread (void * data);
 void
 frida_agent_environment_init (void)
 {
+#if !DEBUG_HEAP_LEAKS && !defined (HAVE_ASAN)
   GMemVTable mem_vtable = {
     gum_malloc,
     gum_realloc,
@@ -74,11 +77,10 @@ frida_agent_environment_init (void)
     gum_malloc,
     gum_realloc
   };
+#endif
 #if defined (G_OS_WIN32) && DEBUG_HEAP_LEAKS
   int tmp_flag;
-#endif
 
-#if defined (G_OS_WIN32) && DEBUG_HEAP_LEAKS
   /*_CrtSetBreakAlloc (1337);*/
 
   _CrtSetReportMode (_CRT_ERROR, _CRTDBG_MODE_FILE);
@@ -94,8 +96,16 @@ frida_agent_environment_init (void)
 #endif
 
   gum_memory_init ();
-  g_mem_set_vtable (&mem_vtable);
-#if DEBUG_HEAP_LEAKS
+#if !DEBUG_HEAP_LEAKS && !defined (HAVE_ASAN)
+  if (RUNNING_ON_VALGRIND)
+  {
+    g_setenv ("G_SLICE", "always-malloc", TRUE);
+  }
+  else
+  {
+    g_mem_set_vtable (&mem_vtable);
+  }
+#else
   g_setenv ("G_SLICE", "always-malloc", TRUE);
 #endif
   glib_init ();
@@ -364,6 +374,9 @@ static void frida_tls_key_context_free (FridaTlsKeyContext * ctx);
 
 static gpointer frida_get_address_of_thread_create_func (void);
 static NativeThreadFuncReturnType NATIVE_THREAD_FUNC_API frida_thread_create_proxy (void * data);
+static void frida_thread_create_context_free (FridaThreadCreateContext * ctx);
+
+static GPrivate frida_thread_create_context_key = G_PRIVATE_INIT ((GDestroyNotify) frida_thread_create_context_free);
 
 static void
 frida_agent_auto_ignorer_shutdown (FridaAgentAutoIgnorer * self)
@@ -568,22 +581,23 @@ frida_get_address_of_thread_create_func (void)
 static NativeThreadFuncReturnType NATIVE_THREAD_FUNC_API
 frida_thread_create_proxy (void * data)
 {
-  GumThreadId current_thread_id;
   FridaThreadCreateContext * ctx = data;
-  NativeThreadFuncReturnType result;
 
-  current_thread_id = gum_process_get_current_thread_id ();
+  gum_script_backend_ignore (gum_process_get_current_thread_id ());
 
-  gum_script_backend_ignore (current_thread_id);
+  /* This allows us to free the data no matter how the thread exits */
+  g_private_set (&frida_thread_create_context_key, ctx);
 
-  result = ctx->thread_func (ctx->thread_data);
+  return ctx->thread_func (ctx->thread_data);
+}
 
+static void
+frida_thread_create_context_free (FridaThreadCreateContext * ctx)
+{
   g_object_unref (ctx->ignorer);
   g_slice_free (FridaThreadCreateContext, ctx);
 
-  gum_script_backend_unignore_later (current_thread_id);
-
-  return result;
+  gum_script_backend_unignore_later (gum_process_get_current_thread_id ());
 }
 
 static void *

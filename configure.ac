@@ -170,6 +170,25 @@ if [[ "x$HAVE_UCLIBC" = "xyes" ]]; then
   AC_DEFINE(HAVE_UCLIBC, 1, [Define to 1 if libc is uClibc.])
 fi
 
+AC_COMPILE_IFELSE(
+  [AC_LANG_PROGRAM([[
+#ifndef __SANITIZE_ADDRESS__
+# ifdef __clang__
+#  if __has_feature(address_sanitizer)
+#   define __SANITIZE_ADDRESS__
+#  endif
+# endif
+#endif
+]], [[
+#ifndef __SANITIZE_ADDRESS__
+# error ASAN disabled
+#endif
+]])],
+  [
+    AC_DEFINE(HAVE_ASAN, 1, [Define to 1 if AddressSanitizer is enabled.])
+  ]
+)
+
 FRIDA_VALAFLAGS=
 if [[ "x$HAVE_LINUX" = "xyes" ]]; then
   FRIDA_VALAFLAGS="$FRIDA_VALAFLAGS -D LINUX"
@@ -242,6 +261,21 @@ if [[ "x$enable_diet" = "xyes" ]]; then
   AC_DEFINE(HAVE_DIET, 1, [Define to 1 if diet mode is enabled.])
 fi
 AM_CONDITIONAL(ENABLE_DIET, [test "x$enable_diet" = "xyes"])
+
+AC_ARG_ENABLE(mapper,
+  [AS_HELP_STRING([--enable-mapper],
+                  [enable mapper when available [default=auto]])],,
+  [enable_mapper=auto])
+if [[ "x$enable_mapper" = "xauto" ]]; then
+  if [[ "x$HAVE_MAC" = "xyes" ]]; then
+    enable_mapper=yes
+  else
+    enable_mapper=no
+  fi
+fi
+if [[ "x$enable_mapper" = "xyes" ]]; then
+  AC_DEFINE(HAVE_MAPPER, 1, [Define to 1 if mapper is enabled.])
+fi
 
 FRIDA_TEST_LIBS=""
 if [[ "x$HAVE_MAC" = "xyes" ]]; then

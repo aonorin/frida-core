@@ -89,7 +89,6 @@ namespace Frida {
 
 		construct {
 			helper = new HelperProcess ();
-			helper.stopped.connect (on_helper_stopped);
 			helper.output.connect (on_output);
 			injector = new Fruitjector.with_helper (helper);
 
@@ -119,12 +118,11 @@ namespace Frida {
 
 			yield helper.close ();
 			helper.output.disconnect (on_output);
-			helper.stopped.disconnect (on_helper_stopped);
 			helper = null;
 		}
 
-		protected override async AgentSession create_system_session () throws Error {
-			return yield helper.create_system_session (agent.file.path);
+		protected override async AgentSessionProvider create_system_session_provider (out DBusConnection connection) throws Error {
+			return yield helper.create_system_session_provider (agent.file.path, out connection);
 		}
 
 		public override async HostApplicationInfo get_frontmost_application () throws Error {
@@ -221,10 +219,6 @@ namespace Frida {
 			return fruit_launcher;
 		}
 
-		private void on_helper_stopped () {
-			release_system_session ();
-		}
-
 		private void on_output (uint pid, int fd, uint8[] data) {
 			output (pid, fd, data);
 		}
@@ -242,68 +236,119 @@ namespace Frida {
 		public static extern bool _is_running_on_ios ();
 	}
 
-	private class FruitLauncher {
+	protected class FruitLauncher : Object {
 		public signal void spawned (HostSpawnInfo info);
 
 		private HelperProcess helper;
 		private AgentResource agent;
-		private UnixSocketAddress service_address;
-		private SocketService service;
+		protected MainContext main_context;
 
 		private string plugin_directory;
 		private string plist_path;
 		private string dylib_path;
+		private string real_dylib_path;
+		protected void * service;
+		private Gee.Promise<bool> service_closed = new Gee.Promise<bool> ();
+		private Gee.Promise<bool> close_request;
+		private Gee.Promise<bool> ensure_request;
 
 		private bool spawn_gating_enabled = false;
-		private Gee.HashMap<string, SpawnRequest> spawn_request_by_identifier = new Gee.HashMap<string, SpawnRequest> ();
+		private Gee.HashMap<string, Gee.Promise<uint>> spawn_request_by_identifier = new Gee.HashMap<string, Gee.Promise<uint>> ();
 		private Gee.HashMap<uint, Loader> loader_by_pid = new Gee.HashMap<uint, Loader> ();
 
 		internal FruitLauncher (HelperProcess helper, AgentResource agent) {
 			this.helper = helper;
 			this.agent = agent;
+			this.main_context = MainContext.ref_thread_default ();
 
-			this.service = new SocketService ();
-			var address = new UnixSocketAddress (Path.build_filename (agent.tempdir.path, "callback"));
-			SocketAddress effective_address;
-			try {
-				this.service.add_address (address, SocketType.STREAM, SocketProtocol.DEFAULT, null, out effective_address);
-			} catch (GLib.Error e) {
-				assert_not_reached ();
-			}
-			assert (effective_address is UnixSocketAddress);
-			this.service_address = effective_address as UnixSocketAddress;
-			FileUtils.chmod (this.service_address.path, 0777);
-			this.service.incoming.connect (this.on_incoming_connection);
+			var tempdir_path = agent.tempdir.path;
 
 			this.plugin_directory = "/Library/MobileSubstrate/DynamicLibraries";
 			var dylib_blob = Frida.Data.Loader.get_fridaloader_dylib_blob ();
 			this.plist_path = Path.build_filename (this.plugin_directory, dylib_blob.name.split (".", 2)[0] + ".plist");
 			this.dylib_path = Path.build_filename (this.plugin_directory, dylib_blob.name);
+			this.real_dylib_path = Path.build_filename (tempdir_path, dylib_blob.name);
 
-			this.service.start ();
+			open_xpc_service ();
+		}
+
+		public override void dispose () {
+			if (close_request == null)
+				close.begin ();
+			else if (close_request.future.ready)
+				base.dispose ();
+		}
+
+		private void check_open () throws Error {
+			if (close_request != null)
+				throw new Error.INVALID_OPERATION ("XPC server is closed; is frida-server running outside launchd?");
 		}
 
 		public async void close () {
-			service.stop ();
-			service = null;
+			if (close_request != null) {
+				try {
+					yield close_request.future.wait_async ();
+				} catch (Gee.FutureError e) {
+					assert_not_reached ();
+				}
+				return;
+			}
+			close_request = new Gee.Promise<bool> ();
+
+			close_xpc_service ();
+
+			try {
+				yield service_closed.future.wait_async ();
+			} catch (Gee.FutureError e) {
+				assert_not_reached ();
+			}
+
+			foreach (var loader in loader_by_pid.values)
+				yield loader.close ();
+			loader_by_pid.clear ();
+
+			foreach (var request in spawn_request_by_identifier.values)
+				request.set_exception (new Error.INVALID_OPERATION ("XPC server is closed; is frida-server running outside launchd?"));
+			spawn_request_by_identifier.clear ();
 
 			FileUtils.unlink (plist_path);
 			FileUtils.unlink (dylib_path);
-			FileUtils.unlink (service_address.path);
+			FileUtils.unlink (real_dylib_path);
 
 			agent = null;
+
+			close_request.set_value (true);
+		}
+
+		protected void on_service_closed () {
+			var source = new IdleSource ();
+			source.set_callback (() => {
+				service_closed.set_value (true);
+
+				if (close_request == null)
+					close.begin ();
+
+				return false;
+			});
+			source.attach (main_context);
 		}
 
 		public async void enable_spawn_gating () throws Error {
+			check_open ();
+
 			yield ensure_loader_deployed ();
 			spawn_gating_enabled = true;
 		}
 
 		public async void disable_spawn_gating () throws Error {
+			check_open ();
+
 			spawn_gating_enabled = false;
 		}
 
 		public HostSpawnInfo[] enumerate_pending_spawns () throws Error {
+			check_open ();
+
 			var result = new HostSpawnInfo[0];
 			var i = 0;
 			foreach (var loader in loader_by_pid.values) {
@@ -317,14 +362,14 @@ namespace Frida {
 		}
 
 		public async uint spawn (string identifier, string? url) throws Error {
+			check_open ();
+
 			yield ensure_loader_deployed ();
 
-			var waiting = false;
-			var timed_out = false;
-			var request = new SpawnRequest (identifier, () => {
-				if (waiting)
-					spawn.callback ();
-			});
+			if (spawn_request_by_identifier.has_key (identifier))
+				throw new Error.INVALID_OPERATION ("Spawn already in progress for the specified identifier");
+
+			var request = new Gee.Promise<uint> ();
 			spawn_request_by_identifier[identifier] = request;
 
 			try {
@@ -335,30 +380,33 @@ namespace Frida {
 				throw e;
 			}
 
-			if (request.result == null) {
-				var timeout = Timeout.add_seconds (10, () => {
-					timed_out = true;
-					spawn.callback ();
-					return false;
-				});
-				waiting = true;
-				yield;
-				waiting = false;
-				if (timed_out) {
-					spawn_request_by_identifier.unset (identifier);
-					throw new Error.TIMED_OUT ("Unexpectedly timed out while waiting for app to launch");
-				} else {
-					Source.remove (timeout);
-				}
-			}
+			var timeout = new TimeoutSource.seconds (10);
+			timeout.set_callback (() => {
+				spawn_request_by_identifier.unset (identifier);
+				request.set_exception (new Error.TIMED_OUT ("Unexpectedly timed out while waiting for app to launch"));
+				return false;
+			});
+			timeout.attach (main_context);
 
-			return request.result.pid;
+			try {
+				var future = request.future;
+				try {
+					return yield future.wait_async ();
+				} catch (Gee.FutureError e) {
+					throw (Error) future.exception;
+				}
+			} finally {
+				timeout.destroy ();
+			}
 		}
 
 		public async bool try_establish (uint pid, string remote_address) throws Error {
 			Loader loader = loader_by_pid[pid];
 			if (loader == null)
 				return false;
+
+			check_open ();
+
 			yield loader.establish (remote_address);
 			return true;
 		}
@@ -367,28 +415,50 @@ namespace Frida {
 			Loader loader;
 			if (!loader_by_pid.unset (pid, out loader))
 				return false;
+
+			check_open ();
+
 			yield loader.resume ();
 			return true;
 		}
 
 		private async void ensure_loader_deployed () throws Error {
-			if (!FileUtils.test (plugin_directory, FileTest.IS_DIR))
-				throw new Error.NOT_SUPPORTED ("Cydia Substrate is required for launching iOS apps");
+			if (ensure_request != null) {
+				var future = ensure_request.future;
+				try {
+					yield future.wait_async ();
+					return;
+				} catch (Gee.FutureError e) {
+					throw (Error) future.exception;
+				}
+			}
+			ensure_request = new Gee.Promise<bool> ();
 
-			yield helper.preload ();
-			agent.ensure_written_to_disk ();
-
-			var dylib_blob = Frida.Data.Loader.get_fridaloader_dylib_blob ();
 			try {
-				FileUtils.set_data (plist_path, generate_loader_plist ());
-				FileUtils.chmod (plist_path, 0644);
-				var real_dylib_path = Path.build_filename (agent.tempdir.path, dylib_blob.name);
-				FileUtils.set_data (real_dylib_path, dylib_blob.data);
-				FileUtils.chmod (real_dylib_path, 0755);
-				FileUtils.unlink (dylib_path);
-				FileUtils.symlink (real_dylib_path, dylib_path);
-			} catch (GLib.FileError e) {
-				throw new Error.NOT_SUPPORTED ("Failed to write loader: " + e.message);
+				if (!FileUtils.test (plugin_directory, FileTest.IS_DIR))
+					throw new Error.NOT_SUPPORTED ("Cydia Substrate is required for launching iOS apps");
+
+				yield helper.preload ();
+				agent.ensure_written_to_disk ();
+
+				var dylib_blob = Frida.Data.Loader.get_fridaloader_dylib_blob ();
+				try {
+					FileUtils.set_data (plist_path, generate_loader_plist ());
+					FileUtils.chmod (plist_path, 0644);
+					FileUtils.set_data (real_dylib_path, dylib_blob.data);
+					FileUtils.chmod (real_dylib_path, 0755);
+					FileUtils.unlink (dylib_path);
+					FileUtils.symlink (real_dylib_path, dylib_path);
+				} catch (GLib.FileError e) {
+					throw new Error.NOT_SUPPORTED ("Failed to write loader: " + e.message);
+				}
+
+				ensure_request.set_value (true);
+			} catch (Error ensure_error) {
+				ensure_request.set_exception (ensure_error);
+				ensure_request = null;
+
+				throw ensure_error;
 			}
 		}
 
@@ -410,9 +480,13 @@ namespace Frida {
 			};
 		}
 
-		private bool on_incoming_connection (SocketConnection connection, Object? source_object) {
-			perform_handshake.begin (new Loader (connection));
-			return true;
+		protected void on_incoming_connection (Loader loader) {
+			var source = new IdleSource ();
+			source.set_callback (() => {
+				perform_handshake.begin (loader);
+				return false;
+			});
+			source.attach (main_context);
 		}
 
 		private async void perform_handshake (Loader loader) {
@@ -426,11 +500,14 @@ namespace Frida {
 					loader.pid = pid;
 					loader.identifier = identifier;
 
-					loader_by_pid[pid] = loader;
+					loader.check_open ();
 
-					SpawnRequest request;
+					loader_by_pid[pid] = loader;
+					loader.closed.connect (on_loader_closed);
+
+					Gee.Promise<uint> request;
 					if (spawn_request_by_identifier.unset (loader.identifier, out request)) {
-						request.complete (loader);
+						request.set_value (pid);
 						return;
 					}
 
@@ -441,45 +518,32 @@ namespace Frida {
 						return;
 					}
 
+					loader.closed.disconnect (on_loader_closed);
 					loader_by_pid.unset (pid);
 				}
 
-				loader.close ();
+				yield loader.close ();
 			} catch (Error e) {
 			}
 		}
 
-		private class SpawnRequest : Object {
-			public delegate void CompletionHandler ();
-
-			public string identifier {
-				get;
-				construct;
-			}
-
-			private CompletionHandler handler;
-
-			public Loader? result {
-				get;
-				private set;
-			}
-
-			public SpawnRequest (string identifier, owned CompletionHandler handler) {
-				Object (identifier: identifier);
-
-				this.handler = (owned) handler;
-			}
-
-			public void complete (Loader r) {
-				result = r;
-				handler ();
-			}
+		private void on_loader_closed (Loader loader) {
+			loader_by_pid.unset (loader.pid);
 		}
 
-		private class Loader {
-			private SocketConnection connection;
-			private InputStream input;
-			private OutputStream output;
+		protected extern void open_xpc_service ();
+		protected extern void close_xpc_service ();
+
+		protected class Loader : Object {
+			public signal void closed (Loader loader);
+
+			protected void * connection;
+			private Gee.Promise<bool> connection_closed = new Gee.Promise<bool> ();
+			private Gee.Promise<bool> close_request;
+
+			private MainContext main_context;
+			private Gee.LinkedList<string> pending_messages = new Gee.LinkedList<string> ();
+			private Gee.LinkedList<Gee.Promise<string>> pending_requests = new Gee.LinkedList<Gee.Promise<string>> ();
 			private bool established = false;
 
 			public uint pid {
@@ -497,63 +561,122 @@ namespace Frida {
 				set;
 			}
 
-			public Loader (SocketConnection connection) {
+			public Loader (void * connection, MainContext main_context) {
 				this.connection = connection;
-				this.input = connection.input_stream;
-				this.output = connection.output_stream;
+				this.main_context = main_context;
 			}
 
-			public void close () {
-				connection.close_async.begin ();
+			public override void dispose () {
+				if (close_request == null)
+					close.begin ();
+				else if (close_request.future.ready)
+					base.dispose ();
+			}
+
+			public void check_open () throws Error {
+				if (close_request != null)
+					throw new Error.INVALID_OPERATION ("Connection is closed");
+			}
+
+			public async void close () {
+				if (close_request != null) {
+					try {
+						yield close_request.future.wait_async ();
+					} catch (Gee.FutureError e) {
+						assert_not_reached ();
+					}
+					return;
+				}
+				close_request = new Gee.Promise<bool> ();
+
+				close_connection ();
+
+				try {
+					yield connection_closed.future.wait_async ();
+				} catch (Gee.FutureError e) {
+					assert_not_reached ();
+				}
+
+				while (!pending_requests.is_empty) {
+					var request = pending_requests.poll ();
+					request.set_exception (new Error.INVALID_OPERATION ("Connection closed"));
+				}
+
+				closed (this);
+
+				close_request.set_value (true);
+			}
+
+			protected void on_connection_closed () {
+				var source = new IdleSource ();
+				source.set_callback (() => {
+					connection_closed.set_value (true);
+
+					if (close_request == null)
+						close.begin ();
+
+					return false;
+				});
+				source.attach (main_context);
 			}
 
 			public async void establish (string remote_address) throws Error {
-				yield send_string (remote_address);
+				send_string (remote_address);
 				established = true;
 			}
 
 			public async void resume () throws Error {
 				if (established)
-					yield send_string ("go");
+					send_string ("go");
 				else
-					close ();
+					close.begin ();
 			}
 
 			public async string recv_string () throws Error {
-				try {
-					var size_buf = new uint8[1];
-					var n = yield input.read_async (size_buf);
-					if (n == 0)
-						throw new Error.TRANSPORT ("Unable to communicate with loader");
-					var size = size_buf[0];
+				check_open ();
 
-					var data_buf = new uint8[size + 1];
-					size_t bytes_read;
-					yield input.read_all_async (data_buf[0:size], Priority.DEFAULT, null, out bytes_read);
-					if (bytes_read != size)
-						throw new Error.TRANSPORT ("Unable to communicate with loader");
-					data_buf[size] = 0;
+				var payload = pending_messages.poll ();
+				if (payload == null) {
+					var request = new Gee.Promise<string> ();
 
-					char * v = data_buf;
-					return (string) v;
-				} catch (GLib.Error e) {
-					throw new Error.TRANSPORT ("Unable to communicate with loader");
+					pending_requests.offer (request);
+
+					var future = request.future;
+					try {
+						return yield future.wait_async ();
+					} catch (Gee.FutureError e) {
+						throw (Error) future.exception;
+					}
 				}
+
+				return payload;
 			}
 
-			public async void send_string (string v) throws Error {
-				var data_buf = new uint8[1 + v.length];
-				data_buf[0] = (uint8) v.length;
-				Memory.copy (data_buf + 1, v, v.length);
-				size_t bytes_written;
-				try {
-					yield output.write_all_async (data_buf, Priority.DEFAULT, null, out bytes_written);
-				} catch (GLib.Error e) {
-					throw new Error.TRANSPORT ("Unable to communicate with loader");
-				}
-				if (bytes_written != data_buf.length)
-					throw new Error.TRANSPORT ("Unable to communicate with loader");
+			public void send_string (string str) throws Error {
+				check_open ();
+
+				send_string_to_connection (str);
 			}
+
+			protected void on_message (string payload) {
+				var source = new IdleSource ();
+				source.set_callback (() => {
+					handle_message (payload);
+					return false;
+				});
+				source.attach (main_context);
+			}
+
+			private void handle_message (string payload) {
+				var request = pending_requests.poll ();
+				if (request != null)
+					request.set_value (payload);
+				else
+					pending_messages.offer (payload);
+			}
+
+			protected extern void close_connection ();
+			protected extern void send_string_to_connection (string str);
 		}
 	}
 }

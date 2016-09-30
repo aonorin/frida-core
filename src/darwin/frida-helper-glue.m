@@ -1,9 +1,3 @@
-#ifdef HAVE_MAC
-# define ENABLE_MAPPER 1
-#else
-# define ENABLE_MAPPER 0
-#endif
-
 #include "frida-helper.h"
 
 #include <dispatch/dispatch.h>
@@ -24,6 +18,7 @@
 #include <mach-o/loader.h>
 #include <mach/exc.h>
 #include <mach/mach.h>
+#include <sys/sysctl.h>
 
 #define FRIDA_AGENT_ENTRYPOINT_NAME      "frida_agent_main"
 #define FRIDA_PSR_THUMB                  0x20
@@ -219,7 +214,7 @@ _frida_helper_service_create_context (FridaHelperService * self)
   FridaHelperContext * ctx;
 
   ctx = g_slice_new (FridaHelperContext);
-  ctx->dispatch_queue = dispatch_queue_create ("re.frida.helper.queue", NULL);
+  ctx->dispatch_queue = dispatch_queue_create ("re.frida.helper.queue", DISPATCH_QUEUE_SERIAL);
 
   self->context = ctx;
 }
@@ -601,25 +596,81 @@ static void
 frida_kill_application (NSString * identifier)
 {
   FridaSpringboardApi * api;
-  FBSSystemService * service;
   GTimer * timer;
+  const double kill_timeout = 3.0;
 
   api = _frida_get_springboard_api ();
-  service = [api->FBSSystemService sharedService];
 
-  [service terminateApplication:identifier
-                      forReason:FBProcessKillReasonUser
-                      andReport:NO
-                withDescription:@"killed from Frida"];
-
-  timer = g_timer_new ();
-
-  while ([service pidForApplication:identifier] > 0 && g_timer_elapsed (timer, NULL) < 3.0)
+  if (api->FBSSystemService != nil)
   {
-    g_usleep (10000);
-  }
+    FBSSystemService * service;
 
-  g_timer_destroy (timer);
+    service = [api->FBSSystemService sharedService];
+
+    [service terminateApplication:identifier
+                        forReason:FBProcessKillReasonUser
+                        andReport:NO
+                  withDescription:@"killed from Frida"];
+
+    timer = g_timer_new ();
+
+    while ([service pidForApplication:identifier] > 0 && g_timer_elapsed (timer, NULL) < kill_timeout)
+    {
+      g_usleep (10000);
+    }
+
+    g_timer_destroy (timer);
+  }
+  else
+  {
+    int name[] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
+    struct kinfo_proc * entries;
+    size_t length;
+    gint err;
+    gboolean found;
+    guint count, i;
+
+    err = sysctl (name, G_N_ELEMENTS (name) - 1, NULL, &length, NULL, 0);
+    g_assert_cmpint (err, !=, -1);
+
+    entries = g_malloc0 (length);
+
+    err = sysctl (name, G_N_ELEMENTS (name) - 1, entries, &length, NULL, 0);
+    g_assert_cmpint (err, !=, -1);
+    count = length / sizeof (struct kinfo_proc);
+
+    for (i = 0, found = FALSE; i != count && !found; i++)
+    {
+      struct kinfo_proc * e = &entries[i];
+      UInt32 pid = e->kp_proc.p_pid;
+      NSString * cur;
+
+      cur = api->SBSCopyDisplayIdentifierForProcessID (pid);
+      if ([cur isEqualToString:identifier])
+      {
+        kill (pid, SIGKILL);
+
+        timer = g_timer_new ();
+
+        while (g_timer_elapsed (timer, NULL) < kill_timeout)
+        {
+          NSString * identifier_of_dying_process = api->SBSCopyDisplayIdentifierForProcessID (pid);
+          if (identifier_of_dying_process == nil)
+            break;
+          [identifier_of_dying_process release];
+          g_usleep (10000);
+        }
+
+        g_timer_destroy (timer);
+
+        found = TRUE;
+
+        [cur release];
+      }
+    }
+
+    g_free (entries);
+  }
 }
 
 #else
@@ -663,6 +714,7 @@ _frida_helper_service_do_inject (FridaHelperService * self, guint pid, const gch
 {
   guint result = 0;
   FridaHelperContext * ctx = self->context;
+  mach_port_t self_task;
   FridaInjectInstance * instance;
   FridaAgentDetails details = { 0, };
   const gchar * failed_operation;
@@ -686,6 +738,8 @@ _frida_helper_service_do_inject (FridaHelperService * self, guint pid, const gch
   thread_state_flavor_t state_flavor;
   dispatch_source_t source;
 
+  self_task = mach_task_self ();
+
   instance = frida_inject_instance_new (self, self->last_id++);
 
   details.pid = pid;
@@ -695,11 +749,11 @@ _frida_helper_service_do_inject (FridaHelperService * self, guint pid, const gch
   if (!gum_darwin_cpu_type_from_pid (pid, &details.cpu_type))
     goto handle_cpu_type_error;
 
-  ret = task_for_pid (mach_task_self (), pid, &details.task);
+  ret = task_for_pid (self_task, pid, &details.task);
   CHECK_MACH_RESULT (ret, ==, KERN_SUCCESS, "task_for_pid");
   instance->task = details.task;
 
-#if ENABLE_MAPPER
+#ifdef HAVE_MAPPER
   mapper = gum_darwin_mapper_new (dylib_path, details.task, details.cpu_type);
 #endif
 
@@ -738,20 +792,49 @@ _frida_helper_service_do_inject (FridaHelperService * self, guint pid, const gch
     goto error_epilogue;
 
   frida_agent_context_emit_mach_stub_code (&agent_ctx, mach_stub_code, details.cpu_type, mapper);
-  ret = mach_vm_write (details.task, payload_address + layout.mach_code_offset,
-      (vm_offset_t) mach_stub_code, sizeof (mach_stub_code));
-  CHECK_MACH_RESULT (ret, ==, KERN_SUCCESS, "mach_vm_write (mach_stub_code)");
 
   frida_agent_context_emit_pthread_stub_code (&agent_ctx, pthread_stub_code, details.cpu_type, mapper);
-  ret = mach_vm_write (details.task, payload_address + layout.pthread_code_offset,
-      (vm_offset_t) pthread_stub_code, sizeof (pthread_stub_code));
-  CHECK_MACH_RESULT (ret, ==, KERN_SUCCESS, "mach_vm_write(pthread_stub_code)");
+
+  if (gum_query_is_rwx_supported ())
+  {
+    ret = mach_vm_write (details.task, payload_address + layout.mach_code_offset,
+        (vm_offset_t) mach_stub_code, sizeof (mach_stub_code));
+    CHECK_MACH_RESULT (ret, ==, KERN_SUCCESS, "mach_vm_write (mach_stub_code)");
+
+    ret = mach_vm_write (details.task, payload_address + layout.pthread_code_offset,
+        (vm_offset_t) pthread_stub_code, sizeof (pthread_stub_code));
+    CHECK_MACH_RESULT (ret, ==, KERN_SUCCESS, "mach_vm_write(pthread_stub_code)");
+
+    ret = mach_vm_protect (details.task, payload_address + layout.code_offset, page_size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+    CHECK_MACH_RESULT (ret, ==, KERN_SUCCESS, "mach_vm_protect");
+  }
+  else
+  {
+    GumCodeSegment * segment;
+    guint8 * scratch_page;
+    mach_vm_address_t code_address;
+    vm_prot_t cur_protection, max_protection;
+
+    segment = gum_code_segment_new (page_size, NULL);
+
+    scratch_page = gum_code_segment_get_address (segment);
+    memcpy (scratch_page + layout.mach_code_offset, mach_stub_code, sizeof (mach_stub_code));
+    memcpy (scratch_page + layout.pthread_code_offset, pthread_stub_code, sizeof (pthread_stub_code));
+
+    gum_code_segment_realize (segment);
+    gum_code_segment_map (segment, 0, page_size, scratch_page);
+
+    code_address = payload_address + layout.code_offset;
+    ret = mach_vm_remap (details.task, &code_address, page_size, 0, VM_FLAGS_OVERWRITE, self_task, (mach_vm_address_t) scratch_page,
+        FALSE, &cur_protection, &max_protection, VM_INHERIT_COPY);
+
+    gum_code_segment_free (segment);
+
+    CHECK_MACH_RESULT (ret, ==, KERN_SUCCESS, "mach_vm_remap");
+  }
 
   ret = mach_vm_write (details.task, payload_address + layout.data_offset, (vm_offset_t) &agent_ctx, sizeof (agent_ctx));
   CHECK_MACH_RESULT (ret, ==, KERN_SUCCESS, "mach_vm_write(data)");
-
-  ret = mach_vm_protect (details.task, payload_address + layout.code_offset, page_size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
-  CHECK_MACH_RESULT (ret, ==, KERN_SUCCESS, "mach_vm_protect");
 
   ret = mach_vm_protect (details.task, payload_address + layout.data_offset, page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE);
   CHECK_MACH_RESULT (ret, ==, KERN_SUCCESS, "mach_vm_protect");
