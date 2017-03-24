@@ -19,6 +19,8 @@ namespace Frida {
 			private set;
 		}
 
+		public delegate bool Predicate (Device device);
+
 		private Gee.Promise<bool> ensure_request;
 		private Gee.Promise<bool> close_request;
 
@@ -44,6 +46,129 @@ namespace Frida {
 		private class CloseTask : ManagerTask<void> {
 			protected override async void perform_operation () throws Error {
 				yield parent.close ();
+			}
+		}
+
+		public async Device get_device_by_id (string id, int timeout = 0, Cancellable? cancellable = null) throws Error {
+			return check_device (yield find_device_by_id (id, timeout, cancellable));
+		}
+
+		public Device get_device_by_id_sync (string id, int timeout = 0, Cancellable? cancellable = null) throws Error {
+			return check_device (find_device_by_id_sync (id, timeout, cancellable));
+		}
+
+		public async Device get_device_by_type (DeviceType type, int timeout = 0, Cancellable? cancellable = null) throws Error {
+			return check_device (yield find_device_by_type (type, timeout, cancellable));
+		}
+
+		public Device get_device_by_type_sync (DeviceType type, int timeout = 0, Cancellable? cancellable = null) throws Error {
+			return check_device (find_device_by_type_sync (type, timeout, cancellable));
+		}
+
+		public async Device get_device (Predicate predicate, int timeout = 0, Cancellable? cancellable = null) throws Error {
+			return check_device (yield find_device (predicate, timeout, cancellable));
+		}
+
+		public Device get_device_sync (Predicate predicate, int timeout = 0, Cancellable? cancellable = null) throws Error {
+			return check_device (find_device_sync (predicate, timeout, cancellable));
+		}
+
+		private Device check_device (Device? device) throws Error {
+			if (device == null)
+				throw new Error.INVALID_ARGUMENT ("Device not found");
+			return device;
+		}
+
+		public async Device? find_device_by_id (string id, int timeout = 0, Cancellable? cancellable = null) throws Error {
+			return yield find_device ((device) => { return device.id == id; }, timeout, cancellable);
+		}
+
+		public Device? find_device_by_id_sync (string id, int timeout = 0, Cancellable? cancellable = null) throws Error {
+			return find_device_sync ((device) => { return device.id == id; }, timeout, cancellable);
+		}
+
+		public async Device? find_device_by_type (DeviceType type, int timeout = 0, Cancellable? cancellable = null) throws Error {
+			return yield find_device ((device) => { return device.dtype == type; }, timeout, cancellable);
+		}
+
+		public Device? find_device_by_type_sync (DeviceType type, int timeout = 0, Cancellable? cancellable = null) throws Error {
+			return find_device_sync ((device) => { return device.dtype == type; }, timeout, cancellable);
+		}
+
+		public async Device? find_device (Predicate predicate, int timeout = 0, Cancellable? cancellable = null) throws Error {
+			check_open ();
+			yield ensure_service ();
+
+			Marshal.throw_if_cancelled (cancellable);
+
+			foreach (var device in devices) {
+				if (predicate (device))
+					return device;
+			}
+
+			if (timeout == 0)
+				return null;
+
+			Device added_device = null;
+			var added_handler = added.connect ((device) => {
+				if (predicate (device)) {
+					added_device = device;
+					find_device.callback ();
+				}
+			});
+
+			Source timeout_source = null;
+			if (timeout > 0) {
+				timeout_source = new TimeoutSource (timeout);
+				timeout_source.set_callback (() => {
+					find_device.callback ();
+					return false;
+				});
+				timeout_source.attach (MainContext.get_thread_default ());
+			}
+
+			CancellableSource cancellable_source = null;
+			if (cancellable != null) {
+				cancellable_source = cancellable.source_new ();
+				cancellable_source.set_callback (() => {
+					find_device.callback ();
+					return false;
+				});
+				cancellable_source.attach (MainContext.get_thread_default ());
+			}
+
+			yield;
+
+			if (cancellable_source != null)
+				cancellable_source.destroy ();
+
+			if (timeout_source != null)
+				timeout_source.destroy ();
+
+			disconnect (added_handler);
+
+			Marshal.throw_if_cancelled (cancellable);
+
+			return added_device;
+		}
+
+		public Device? find_device_sync (Predicate predicate, int timeout = 0, Cancellable? cancellable = null) throws Error {
+			var task = create<FindDeviceTask> () as FindDeviceTask;
+			task.predicate = (device) => {
+				return predicate (device);
+			};
+			task.timeout = timeout;
+			task.cancellable = cancellable;
+			return task.start_and_wait_for_completion ();
+		}
+
+		private class FindDeviceTask : ManagerTask<Device?> {
+			public Predicate predicate;
+			public int timeout;
+			public Cancellable? cancellable;
+
+			protected override async Device? perform_operation () throws Error {
+				return yield parent.find_device (predicate, timeout, cancellable);
 			}
 		}
 
@@ -117,7 +242,7 @@ namespace Frida {
 
 			foreach (var device in devices) {
 				if (device.id == id) {
-					yield device._do_close (true);
+					yield device._do_close (SessionDetachReason.APPLICATION_REQUESTED, true);
 					removed (device);
 					changed ();
 					return;
@@ -172,7 +297,7 @@ namespace Frida {
 					if (device.provider == provider) {
 						if (started)
 							removed (device);
-						device._do_close.begin (false);
+						device._do_close.begin (SessionDetachReason.DEVICE_LOST, false);
 						break;
 					}
 				}
@@ -211,7 +336,7 @@ namespace Frida {
 
 			if (service != null) {
 				foreach (var device in devices.to_array ())
-					yield device._do_close (true);
+					yield device._do_close (SessionDetachReason.APPLICATION_REQUESTED, true);
 				devices.clear ();
 
 				yield service.stop ();
@@ -251,7 +376,8 @@ namespace Frida {
 
 	public class Device : Object {
 		public signal void spawned (Spawn spawn);
-		public signal void output (uint pid, int fd, uint8[] data);
+		public signal void output (uint pid, int fd, Bytes data);
+		public signal void uninjected (uint id);
 		public signal void lost ();
 
 		public string id {
@@ -283,6 +409,8 @@ namespace Frida {
 			get;
 			private set;
 		}
+
+		public delegate bool ProcessPredicate (Process process);
 
 		private weak DeviceManager manager;
 		private string? location;
@@ -376,6 +504,143 @@ namespace Frida {
 			}
 		}
 
+		public async Process get_process_by_pid (uint pid) throws Error {
+			return check_process (yield find_process_by_pid (pid));
+		}
+
+		public Process get_process_by_pid_sync (uint pid) throws Error {
+			return check_process (find_process_by_pid_sync (pid));
+		}
+
+		public async Process get_process_by_name (string name, int timeout = 0, Cancellable? cancellable = null) throws Error {
+			return check_process (yield find_process_by_name (name, timeout, cancellable));
+		}
+
+		public Process get_process_by_name_sync (string name, int timeout = 0, Cancellable? cancellable = null) throws Error {
+			return check_process (find_process_by_name_sync (name, timeout, cancellable));
+		}
+
+		public async Process get_process (ProcessPredicate predicate, int timeout = 0, Cancellable? cancellable = null) throws Error {
+			return check_process (yield find_process (predicate, timeout, cancellable));
+		}
+
+		public Process get_process_sync (ProcessPredicate predicate, int timeout = 0, Cancellable? cancellable = null) throws Error {
+			return check_process (find_process_sync (predicate, timeout, cancellable));
+		}
+
+		private Process check_process (Process? process) throws Error {
+			if (process == null)
+				throw new Error.INVALID_ARGUMENT ("Process not found");
+			return process;
+		}
+
+		public async Process? find_process_by_pid (uint pid) throws Error {
+			return yield find_process ((process) => { return process.pid == pid; });
+		}
+
+		public Process? find_process_by_pid_sync (uint pid) throws Error {
+			return find_process_sync ((process) => { return process.pid == pid; });
+		}
+
+		public async Process? find_process_by_name (string name, int timeout = 0, Cancellable? cancellable = null) throws Error {
+			var folded_name = name.casefold ();
+			return yield find_process ((process) => { return process.name.casefold () == folded_name; }, timeout, cancellable);
+		}
+
+		public Process? find_process_by_name_sync (string name, int timeout = 0, Cancellable? cancellable = null) throws Error {
+			var folded_name = name.casefold ();
+			return find_process_sync ((process) => { return process.name.casefold () == folded_name; }, timeout, cancellable);
+		}
+
+		public async Process? find_process (ProcessPredicate predicate, int timeout = 0, Cancellable? cancellable = null) throws Error {
+			Process process = null;
+			bool done = false;
+			bool waiting = false;
+
+			Source timeout_source = null;
+			if (timeout > 0) {
+				timeout_source = new TimeoutSource (timeout);
+				timeout_source.set_callback (() => {
+					done = true;
+					if (waiting)
+						find_process.callback ();
+					return false;
+				});
+				timeout_source.attach (MainContext.get_thread_default ());
+			}
+
+			CancellableSource cancellable_source = null;
+			if (cancellable != null) {
+				cancellable_source = cancellable.source_new ();
+				cancellable_source.set_callback (() => {
+					done = true;
+					if (waiting)
+						find_process.callback ();
+					return false;
+				});
+				cancellable_source.attach (MainContext.get_thread_default ());
+			}
+
+			while (!done) {
+				var processes = yield enumerate_processes ();
+
+				var num_processes = processes.size ();
+				for (var i = 0; i != num_processes; i++) {
+					var p = processes.get (i);
+					if (predicate (p)) {
+						process = p;
+						break;
+					}
+				}
+
+				if (process != null || done || timeout == 0)
+					break;
+
+				var poll_again_source = new TimeoutSource (500);
+				poll_again_source.set_callback (() => {
+					find_process.callback ();
+					return false;
+				});
+				poll_again_source.attach (MainContext.get_thread_default ());
+
+				waiting = true;
+				yield;
+				waiting = false;
+
+				poll_again_source.destroy ();
+			}
+
+			if (cancellable_source != null)
+				cancellable_source.destroy ();
+
+			if (timeout_source != null)
+				timeout_source.destroy ();
+
+			Marshal.throw_if_cancelled (cancellable);
+
+			return process;
+		}
+
+		public Process? find_process_sync (ProcessPredicate predicate, int timeout = 0, Cancellable? cancellable = null) throws Error {
+			var task = create<FindProcessTask> () as FindProcessTask;
+			task.predicate = (process) => {
+				return predicate (process);
+			};
+			task.timeout = timeout;
+			task.cancellable = cancellable;
+			return task.start_and_wait_for_completion ();
+		}
+
+		private class FindProcessTask : DeviceTask<Process?> {
+			public ProcessPredicate predicate;
+			public int timeout;
+			public Cancellable? cancellable;
+
+			protected override async Process? perform_operation () throws Error {
+				return yield parent.find_process (predicate, timeout, cancellable);
+			}
+		}
+
 		public async ProcessList enumerate_processes () throws Error {
 			check_open ();
 
@@ -407,7 +672,7 @@ namespace Frida {
 		private Icon? icon_from_image_data (ImageData? img) {
 			if (img == null || img.width == 0)
 				return null;
-			return new Icon (img.width, img.height, img.rowstride, Base64.decode (img.pixels));
+			return new Icon (img.width, img.height, img.rowstride, new Bytes.take (Base64.decode (img.pixels)));
 		}
 
 		public async void enable_spawn_gating () throws Error {
@@ -519,19 +784,18 @@ namespace Frida {
 			}
 		}
 
-		public async void input (uint pid, uint8[] data) throws Error {
+		public async void input (uint pid, Bytes data) throws Error {
 			check_open ();
 
 			try {
-				var data_copy = data; /* FIXME: workaround for Vala compiler bug */
 				yield ensure_host_session ();
-				yield host_session.input (pid, data_copy);
+				yield host_session.input (pid, data.get_data ());
 			} catch (GLib.Error e) {
 				throw Marshal.from_dbus (e);
 			}
 		}
 
-		public void input_sync (uint pid, uint8[] data) throws Error {
+		public void input_sync (uint pid, Bytes data) throws Error {
 			var task = create<InputTask> () as InputTask;
 			task.pid = pid;
 			task.data = data;
@@ -540,7 +804,7 @@ namespace Frida {
 
 		private class InputTask : DeviceTask<void> {
 			public uint pid;
-			public uint8[] data;
+			public Bytes data;
 
 			protected override async void perform_operation () throws Error {
 				yield parent.input (pid, data);
@@ -640,12 +904,80 @@ namespace Frida {
 			}
 		}
 
+		public async uint inject_library_file (uint pid, string path, string entrypoint, string data) throws Error {
+			check_open ();
+
+			try {
+				yield ensure_host_session ();
+
+				var id = yield host_session.inject_library_file (pid, path, entrypoint, data);
+
+				return id.handle;
+			} catch (GLib.Error e) {
+				throw Marshal.from_dbus (e);
+			}
+		}
+
+		public uint inject_library_file_sync (uint pid, string path, string entrypoint, string data) throws Error {
+			var task = create<InjectLibraryFileTask> () as InjectLibraryFileTask;
+			task.pid = pid;
+			task.path = path;
+			task.entrypoint = entrypoint;
+			task.data = data;
+			return task.start_and_wait_for_completion ();
+		}
+
+		private class InjectLibraryFileTask : DeviceTask<uint> {
+			public uint pid;
+			public string path;
+			public string entrypoint;
+			public string data;
+
+			protected override async uint perform_operation () throws Error {
+				return yield parent.inject_library_file (pid, path, entrypoint, data);
+			}
+		}
+
+		public async uint inject_library_blob (uint pid, Bytes blob, string entrypoint, string data) throws Error {
+			check_open ();
+
+			try {
+				yield ensure_host_session ();
+
+				var id = yield host_session.inject_library_blob (pid, blob.get_data (), entrypoint, data);
+
+				return id.handle;
+			} catch (GLib.Error e) {
+				throw Marshal.from_dbus (e);
+			}
+		}
+
+		public uint inject_library_blob_sync (uint pid, Bytes blob, string entrypoint, string data) throws Error {
+			var task = create<InjectLibraryBlobTask> () as InjectLibraryBlobTask;
+			task.pid = pid;
+			task.blob = blob;
+			task.entrypoint = entrypoint;
+			task.data = data;
+			return task.start_and_wait_for_completion ();
+		}
+
+		private class InjectLibraryBlobTask : DeviceTask<uint> {
+			public uint pid;
+			public Bytes blob;
+			public string entrypoint;
+			public string data;
+
+			protected override async uint perform_operation () throws Error {
+				return yield parent.inject_library_blob (pid, blob, entrypoint, data);
+			}
+		}
+
 		private void check_open () throws Error {
 			if (close_request != null)
 				throw new Error.INVALID_OPERATION ("Device is gone");
 		}
 
-		public async void _do_close (bool may_block) {
+		public async void _do_close (SessionDetachReason reason, bool may_block) {
 			if (close_request != null) {
 				try {
 					yield close_request.future.wait_async ();
@@ -684,7 +1016,7 @@ namespace Frida {
 			}
 
 			foreach (var session in session_by_handle.values.to_array ()) {
-				yield session._do_close (may_block);
+				yield session._do_close (reason, may_block);
 			}
 			session_by_handle.clear ();
 
@@ -694,6 +1026,7 @@ namespace Frida {
 			if (host_session != null) {
 				host_session.spawned.disconnect (on_spawned);
 				host_session.output.disconnect (on_output);
+				host_session.uninjected.disconnect (on_uninjected);
 				if (may_block) {
 					try {
 						yield provider.destroy (host_session);
@@ -753,6 +1086,7 @@ namespace Frida {
 				host_session = yield provider.create (location);
 				host_session.spawned.connect (on_spawned);
 				host_session.output.connect (on_output);
+				host_session.uninjected.connect (on_uninjected);
 				ensure_request.set_value (true);
 			} catch (Error e) {
 				ensure_request.set_exception (e);
@@ -766,7 +1100,11 @@ namespace Frida {
 		}
 
 		private void on_output (uint pid, int fd, uint8[] data) {
-			output (pid, fd, data);
+			output (pid, fd, new Bytes (data));
+		}
+
+		private void on_uninjected (InjectorPayloadId id) {
+			uninjected (id.handle);
 		}
 
 		private void on_host_session_closed (HostSession session) {
@@ -775,17 +1113,18 @@ namespace Frida {
 
 			host_session.spawned.disconnect (on_spawned);
 			host_session.output.disconnect (on_output);
+			host_session.uninjected.disconnect (on_uninjected);
 			host_session = null;
 
 			ensure_request = null;
 		}
 
-		private void on_agent_session_closed (AgentSessionId id) {
+		private void on_agent_session_closed (AgentSessionId id, SessionDetachReason reason) {
 			var handle = id.handle;
 
 			var session = session_by_handle[handle];
 			if (session != null)
-				session._do_close.begin (false);
+				session._do_close.begin (reason, false);
 
 			Gee.Promise<bool> detach_request;
 			if (pending_detach_requests.unset (handle, out detach_request))
@@ -955,12 +1294,12 @@ namespace Frida {
 			private set;
 		}
 
-		public uint8[] pixels {
+		public Bytes pixels {
 			get;
 			private set;
 		}
 
-		public Icon (int width, int height, int rowstride, uint8[] pixels) {
+		public Icon (int width, int height, int rowstride, Bytes pixels) {
 			this.width = width;
 			this.height = height;
 			this.rowstride = rowstride;
@@ -969,7 +1308,7 @@ namespace Frida {
 	}
 
 	public class Session : Object {
-		public signal void detached ();
+		public signal void detached (SessionDetachReason reason);
 
 		public uint pid {
 			get;
@@ -1009,7 +1348,7 @@ namespace Frida {
 		}
 
 		public async void detach () {
-			yield _do_close (true);
+			yield _do_close (SessionDetachReason.APPLICATION_REQUESTED, true);
 		}
 
 		public void detach_sync () {
@@ -1172,30 +1511,30 @@ namespace Frida {
 			}
 		}
 
-		public async void disable_jit () throws Error {
+		public async void enable_jit () throws Error {
 			check_open ();
 
 			try {
-				yield session.disable_jit ();
+				yield session.enable_jit ();
 			} catch (GLib.Error e) {
 				throw Marshal.from_dbus (e);
 			}
 		}
 
-		public void disable_jit_sync () throws Error {
-			(create<DisableJitTask> () as DisableJitTask).start_and_wait_for_completion ();
+		public void enable_jit_sync () throws Error {
+			(create<EnableJitTask> () as EnableJitTask).start_and_wait_for_completion ();
 		}
 
-		private class DisableJitTask : ProcessTask<void> {
+		private class EnableJitTask : ProcessTask<void> {
 			protected override async void perform_operation () throws Error {
-				yield parent.disable_jit ();
+				yield parent.enable_jit ();
 			}
 		}
 
-		private void on_message_from_script (AgentScriptId sid, string message, uint8[] data) {
+		private void on_message_from_script (AgentScriptId sid, string message, bool has_data, uint8[] data) {
 			var script = script_by_id[sid.handle];
 			if (script != null)
-				script.message (message, data);
+				script.message (message, has_data ? new Bytes (data) : null);
 		}
 
 		public void _release_script (AgentScriptId sid) {
@@ -1208,7 +1547,7 @@ namespace Frida {
 				throw new Error.INVALID_OPERATION ("Session is detached");
 		}
 
-		public async void _do_close (bool may_block) {
+		public async void _do_close (SessionDetachReason reason, bool may_block) {
 			if (close_request != null) {
 				try {
 					yield close_request.future.wait_async ();
@@ -1235,7 +1574,7 @@ namespace Frida {
 			yield device._release_session (this, may_block);
 			device = null;
 
-			detached ();
+			detached (reason);
 			close_request.set_value (true);
 		}
 
@@ -1253,7 +1592,7 @@ namespace Frida {
 
 	public class Script : Object {
 		public signal void destroyed ();
-		public signal void message (string message, uint8[] data);
+		public signal void message (string message, Bytes? data);
 
 		public MainContext main_context {
 			get;
@@ -1309,27 +1648,32 @@ namespace Frida {
 			}
 		}
 
-		public async void post_message (string message) throws Error {
+		public async void post (string message, Bytes? data = null) throws Error {
 			check_open ();
 
+			var has_data = data != null;
+			var data_param = has_data ? data.get_data () : new uint8[0];
+
 			try {
-				yield session.session.post_message_to_script (script_id, message);
+				yield session.session.post_to_script (script_id, message, has_data, data_param);
 			} catch (GLib.Error e) {
 				throw Marshal.from_dbus (e);
 			}
 		}
 
-		public void post_message_sync (string message) throws Error {
-			var task = create<PostMessageTask> () as PostMessageTask;
+		public void post_sync (string message, Bytes? data = null) throws Error {
+			var task = create<PostTask> () as PostTask;
 			task.message = message;
+			task.data = data;
 			task.start_and_wait_for_completion ();
 		}
 
-		private class PostMessageTask : ScriptTask<void> {
+		private class PostTask : ScriptTask<void> {
 			public string message;
+			public Bytes? data;
 
 			protected override async void perform_operation () throws Error {
-				yield parent.post_message (message);
+				yield parent.post (message, data);
 			}
 		}
 
@@ -1371,243 +1715,188 @@ namespace Frida {
 		}
 	}
 
-	private class Debugger : Object {
-		private uint16 port;
-		private AgentSession session;
+	public interface Injector : Object {
+		public signal void uninjected (uint id);
 
-		private SocketService service;
-		private Gee.HashSet<DebugSession> sessions = new Gee.HashSet<DebugSession> ();
-
-		public Debugger (uint16 port, AgentSession session) {
-			this.port = port;
-			this.session = session;
+		public static Injector new () {
+#if WINDOWS
+			return new Winjector ();
+#endif
+#if DARWIN
+			var tempdir = new TemporaryDirectory ();
+			var helper = new DarwinHelperProcess (tempdir);
+			return new Fruitjector (helper, true, tempdir);
+#endif
+#if LINUX
+			return new Linjector ();
+#endif
+#if QNX
+			return new Qinjector ();
+#endif
 		}
 
-		public async void enable () throws Error {
-			if (service != null)
-				throw new Error.INVALID_OPERATION ("Debugger is already enabled");
-			service = new SocketService ();
+		public abstract async void close ();
+
+		public void close_sync () {
 			try {
-				service.add_inet_port (port, null);
-			} catch (GLib.Error e) {
-				service = null;
-				throw new Error.ADDRESS_IN_USE (e.message);
-			}
-			service.incoming.connect (on_incoming_connection);
-			service.start ();
-			bool enabled = false;
-			try {
-				yield session.enable_debugger ();
-				enabled = true;
-			} catch (GLib.Error e) {
-				throw Marshal.from_dbus (e);
-			} finally {
-				if (!enabled) {
-					service.stop ();
-					service = null;
-				}
+				(create<CloseTask> () as CloseTask).start_and_wait_for_completion ();
+			} catch (Error e) {
+				assert_not_reached ();
 			}
 		}
 
-		public void disable () {
-			if (service == null)
+		private class CloseTask : InjectorTask<void> {
+			protected override async void perform_operation () throws Error {
+				yield parent.close ();
+			}
+		}
+
+		public abstract async uint inject_library_file (uint pid, string path, string entrypoint, string data) throws Error;
+
+		public uint inject_library_file_sync (uint pid, string path, string entrypoint, string data) throws Error {
+			var task = create<InjectLibraryFileTask> () as InjectLibraryFileTask;
+			task.pid = pid;
+			task.path = path;
+			task.entrypoint = entrypoint;
+			task.data = data;
+			return task.start_and_wait_for_completion ();
+		}
+
+		private class InjectLibraryFileTask : InjectorTask<uint> {
+			public uint pid;
+			public string path;
+			public string entrypoint;
+			public string data;
+
+			protected override async uint perform_operation () throws Error {
+				return yield parent.inject_library_file (pid, path, entrypoint, data);
+			}
+		}
+
+		public abstract async uint inject_library_blob (uint pid, Bytes blob, string entrypoint, string data) throws Error;
+
+		public uint inject_library_blob_sync (uint pid, Bytes blob, string entrypoint, string data) throws Error {
+			var task = create<InjectLibraryBlobTask> () as InjectLibraryBlobTask;
+			task.pid = pid;
+			task.blob = blob;
+			task.entrypoint = entrypoint;
+			task.data = data;
+			return task.start_and_wait_for_completion ();
+		}
+
+		private class InjectLibraryBlobTask : InjectorTask<uint> {
+			public uint pid;
+			public Bytes blob;
+			public string entrypoint;
+			public string data;
+
+			protected override async uint perform_operation () throws Error {
+				return yield parent.inject_library_blob (pid, blob, entrypoint, data);
+			}
+		}
+
+		private Object create<T> () {
+			return Object.new (typeof (T), main_context: get_main_context (), parent: this);
+		}
+
+		private abstract class InjectorTask<T> : AsyncTask<T> {
+			public weak Injector parent {
+				get;
+				construct;
+			}
+		}
+	}
+
+	public class FileMonitor : Object {
+		public signal void change (string file_path, string? other_file_path, FileMonitorEvent event);
+
+		public string path {
+			get;
+			construct;
+		}
+
+		public MainContext main_context {
+			get;
+			construct;
+		}
+
+		private GLib.FileMonitor monitor;
+
+		public FileMonitor (string path) {
+			Object (path: path, main_context: get_main_context ());
+		}
+
+		~FileMonitor () {
+			clear ();
+		}
+
+		public async void enable (Cancellable? cancellable = null) throws Error {
+			if (monitor != null)
+				throw new Error.INVALID_OPERATION ("Already enabled");
+
+			var file = File.parse_name (path);
+
+			try {
+				monitor = file.monitor (FileMonitorFlags.NONE, cancellable);
+			} catch (GLib.Error e) {
+				throw new Error.INVALID_OPERATION (e.message);
+			}
+
+			monitor.changed.connect (on_changed);
+		}
+
+		public void enable_sync (Cancellable? cancellable = null) throws Error {
+			var task = create<EnableTask> () as EnableTask;
+			task.cancellable = cancellable;
+			task.start_and_wait_for_completion ();
+		}
+
+		private class EnableTask : FileMonitorTask<void> {
+			public Cancellable? cancellable;
+
+			protected override async void perform_operation () throws Error {
+				yield parent.enable (cancellable);
+			}
+		}
+
+		public async void disable () throws Error {
+			if (monitor == null)
+				throw new Error.INVALID_OPERATION ("Already disabled");
+
+			clear ();
+		}
+
+		private void clear () {
+			if (monitor == null)
 				return;
-			if (session != null) {
-				session.disable_debugger.begin ();
-				session = null;
-			}
-			service.stop ();
+
+			monitor.changed.disconnect (on_changed);
+			monitor.cancel ();
+			monitor = null;
 		}
 
-		private bool on_incoming_connection (SocketConnection connection, Object? source_object) {
-			var session = new DebugSession (session, connection);
-			session.ended.connect (on_session_ended);
-			sessions.add (session);
-			session.open ();
-			return true;
+		public void disable_sync () throws Error {
+			(create<DisableTask> () as DisableTask).start_and_wait_for_completion ();
 		}
 
-		private void on_session_ended (DebugSession session) {
-			sessions.remove (session);
-			session.close ();
+		private class DisableTask : FileMonitorTask<void> {
+			protected override async void perform_operation () throws Error {
+				yield parent.disable ();
+			}
 		}
 
-		private class DebugSession : Object {
-			public signal void ended (DebugSession session);
+		private void on_changed (File file, File? other_file, FileMonitorEvent event) {
+			change (file.get_parse_name (), (other_file != null) ? other_file.get_parse_name () : null, event);
+		}
 
-			private const size_t CHUNK_SIZE = 512;
-			private const size_t MAX_MESSAGE_SIZE = 2048;
+		private Object create<T> () {
+			return Object.new (typeof (T), main_context: main_context, parent: this);
+		}
 
-			private weak AgentSession agent_session;
-
-			private IOStream stream;
-			private InputStream input;
-			private OutputStream output;
-
-			private char * buffer;
-			private size_t length;
-			private size_t capacity;
-
-			private Queue<string> outgoing = new Queue<string> ();
-
-			public DebugSession (AgentSession agent_session, IOStream stream) {
-				this.agent_session = agent_session;
-
-				this.stream = stream;
-				this.input = stream.get_input_stream ();
-				this.output = stream.get_output_stream ();
-
-				agent_session.message_from_debugger.connect (on_message_from_debugger);
-			}
-
-			~DebugSession () {
-				free (buffer);
-
-				close ();
-			}
-
-			public void open () {
-				var headers = new string[] {
-					"Type", "connect",
-					"V8-Version", "4.3.62", // FIXME
-					"Protocol-Version", "1",
-					"Embedding-Host", "Frida " + Frida.version_string ()
-				};
-				var body = "";
-				send (headers, body);
-
-				process_incoming_messages.begin ();
-			}
-
-			public void close () {
-				agent_session.message_from_debugger.disconnect (on_message_from_debugger);
-
-				if (stream != null) {
-					stream.close_async.begin ();
-					stream = null;
-				}
-			}
-
-			private void on_message_from_debugger (string message) {
-				send (new string[] {}, message);
-			}
-
-			private void send (string[] headers, string content) {
-				assert (headers.length % 2 == 0);
-
-				var message = new StringBuilder ("");
-				for (var i = 0; i != headers.length; i += 2) {
-					var key = headers[i];
-					var val = headers[i + 1];
-					message.append_printf ("%s: %s\r\n", key, val);
-				}
-				message.append_printf ("Content-Length: %ld\r\n\r\n%s", content.length, content);
-
-				var write_now = outgoing.is_empty ();
-				outgoing.push_tail (message.str);
-				if (write_now)
-					process_outgoing_messages.begin ();
-			}
-
-			private async void process_incoming_messages () {
-				try {
-					while (true) {
-						var message = yield read_message ();
-						yield agent_session.post_message_to_debugger (message);
-					}
-				} catch (GLib.Error e) {
-					ended (this);
-				}
-			}
-
-			private async void process_outgoing_messages () {
-				try {
-					do {
-						var m = outgoing.peek_head ();
-						unowned uint8[] buf = (uint8[]) m;
-						yield output.write_all_async (buf[0:m.length], Priority.DEFAULT, null, null);
-						outgoing.pop_head ();
-					} while (!outgoing.is_empty ());
-				} catch (GLib.Error e) {
-				}
-			}
-
-			private async string read_message () throws IOError {
-				long message_length = 0;
-				long header_length = 0;
-				long content_length = 0;
-
-				while (true) {
-					if (length > 0) {
-						unowned string message = (string) buffer;
-
-						if (message_length == 0) {
-							int header_end = message.index_of ("\r\n\r\n");
-							if (header_end != -1) {
-								header_length = header_end + 4;
-								var headers = message[0:header_end];
-								parse_headers (headers, out content_length);
-								message_length = header_length + content_length;
-							}
-						}
-
-						if (message_length != 0 && length >= message_length) {
-							var content = message[header_length:message_length];
-							consume_buffer (message_length);
-							return content;
-						}
-					}
-
-					yield fill_buffer ();
-				}
-			}
-
-			private async void fill_buffer () throws IOError {
-				var available = capacity - length;
-				if (available < CHUNK_SIZE) {
-					capacity = size_t.min (capacity + (CHUNK_SIZE - available), MAX_MESSAGE_SIZE);
-					buffer = realloc (buffer, capacity + 1);
-
-					available = capacity - length;
-				}
-
-				if (available == 0)
-					throw new IOError.FAILED ("Maximum message size exceeded");
-
-				buffer[length + available] = 0;
-				unowned uint8[] buf = (uint8[]) buffer;
-				ssize_t n = yield input.read_async (buf[length:length + available]);
-				if (n == 0)
-					throw new IOError.CLOSED ("Connection is closed");
-				length += n;
-			}
-
-			private void consume_buffer (long n) {
-				length -= n;
-				if (length > 0) {
-					Memory.move (buffer, buffer + n, length);
-					buffer[length] = 0;
-				}
-			}
-
-			private void parse_headers (string headers, out long content_length) throws IOError {
-				var lines = headers.split ("\r\n");
-				foreach (var line in lines) {
-					var tokens = line.split (": ", 2);
-					if (tokens.length != 2)
-						throw new IOError.FAILED ("Malformed header");
-					var key = tokens[0];
-					var val = tokens[1];
-					if (key == "Content-Length") {
-						uint64 l;
-						if (uint64.try_parse (val, out l)) {
-							content_length = (long) l;
-							return;
-						}
-					}
-				}
-
-				throw new IOError.FAILED ("Missing content length");
+		private abstract class FileMonitorTask<T> : AsyncTask<T> {
+			public weak FileMonitor parent {
+				get;
+				construct;
 			}
 		}
 	}
@@ -1671,4 +1960,39 @@ namespace Frida {
 
 		protected abstract async T perform_operation () throws Error;
 	}
+
+	private Mutex gc_mutex;
+	private uint gc_generation = 0;
+	private bool gc_scheduled = false;
+
+	public void on_pending_garbage (void * data) {
+		gc_mutex.lock ();
+		gc_generation++;
+		bool already_scheduled = gc_scheduled;
+		gc_scheduled = true;
+		gc_mutex.unlock ();
+
+		if (already_scheduled)
+			return;
+
+		Timeout.add (50, () => {
+			gc_mutex.lock ();
+			uint generation = gc_generation;
+			gc_mutex.unlock ();
+
+			bool collected_everything = garbage_collect ();
+
+			gc_mutex.lock ();
+			bool same_generation = generation == gc_generation;
+			bool repeat = !collected_everything || !same_generation;
+			if (!repeat)
+				gc_scheduled = false;
+			gc_mutex.unlock ();
+
+			return repeat;
+		});
+	}
+
+	[CCode (cname = "g_thread_garbage_collect")]
+	private extern bool garbage_collect ();
 }

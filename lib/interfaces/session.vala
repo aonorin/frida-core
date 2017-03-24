@@ -1,5 +1,5 @@
 namespace Frida {
-	[DBus (name = "re.frida.HostSession8")]
+	[DBus (name = "re.frida.HostSession9")]
 	public interface HostSession : Object {
 		public abstract async HostApplicationInfo get_frontmost_application () throws GLib.Error;
 		public abstract async HostApplicationInfo[] enumerate_applications () throws GLib.Error;
@@ -13,13 +13,17 @@ namespace Frida {
 		public abstract async void resume (uint pid) throws GLib.Error;
 		public abstract async void kill (uint pid) throws GLib.Error;
 		public abstract async AgentSessionId attach_to (uint pid) throws GLib.Error;
+		public abstract async InjectorPayloadId inject_library_file (uint pid, string path, string entrypoint, string data) throws GLib.Error;
+		public abstract async InjectorPayloadId inject_library_blob (uint pid, uint8[] blob, string entrypoint, string data) throws GLib.Error;
 
 		public signal void spawned (HostSpawnInfo info);
 		public signal void output (uint pid, int fd, uint8[] data);
-		public signal void agent_session_destroyed (AgentSessionId id);
+		public signal void agent_session_destroyed (AgentSessionId id); // TODO: remove in Frida 10.x
+		public signal void agent_session_destroyed_with_reason (AgentSessionId id, SessionDetachReason reason);
+		public signal void uninjected (InjectorPayloadId id);
 	}
 
-	[DBus (name = "re.frida.AgentSessionProvider8")]
+	[DBus (name = "re.frida.AgentSessionProvider9")]
 	public interface AgentSessionProvider : Object {
 		public abstract async void open (AgentSessionId id) throws GLib.Error;
 		public abstract async void unload () throws GLib.Error;
@@ -28,7 +32,7 @@ namespace Frida {
 		public signal void closed (AgentSessionId id);
 	}
 
-	[DBus (name = "re.frida.AgentSession8")]
+	[DBus (name = "re.frida.AgentSession9")]
 	public interface AgentSession : Object {
 		public abstract async void close () throws GLib.Error;
 
@@ -37,15 +41,22 @@ namespace Frida {
 		public abstract async uint8[] compile_script (string source) throws GLib.Error;
 		public abstract async void destroy_script (AgentScriptId sid) throws GLib.Error;
 		public abstract async void load_script (AgentScriptId sid) throws GLib.Error;
-		public abstract async void post_message_to_script (AgentScriptId sid, string message) throws GLib.Error;
-		public signal void message_from_script (AgentScriptId sid, string message, uint8[] data);
+		public abstract async void post_to_script (AgentScriptId sid, string message, bool has_data, uint8[] data) throws GLib.Error;
+		public signal void message_from_script (AgentScriptId sid, string message, bool has_data, uint8[] data);
 
 		public abstract async void enable_debugger () throws GLib.Error;
 		public abstract async void disable_debugger () throws GLib.Error;
 		public abstract async void post_message_to_debugger (string message) throws GLib.Error;
 		public signal void message_from_debugger (string message);
 
-		public abstract async void disable_jit () throws GLib.Error;
+		public abstract async void enable_jit () throws GLib.Error;
+	}
+
+	public enum SessionDetachReason {
+		APPLICATION_REQUESTED = 1,
+		PROCESS_TERMINATED,
+		SERVER_TERMINATED,
+		DEVICE_LOST
 	}
 
 	[DBus (name = "re.frida.Error")]
@@ -75,6 +86,17 @@ namespace Frida {
 					"please ensure that major versions match and that the remote Frida has the feature you are trying to use");
 			} else {
 				return new Frida.Error.TRANSPORT (e.message);
+			}
+		}
+
+		public static void throw_if_cancelled (Cancellable? cancellable) throws Error {
+			if (cancellable == null)
+				return;
+
+			try {
+				cancellable.set_error_if_cancelled ();
+			} catch (IOError e) {
+				throw new Error.INVALID_OPERATION (e.message);
 			}
 		}
 	}
@@ -179,6 +201,40 @@ namespace Frida {
 
 		public AgentScriptId (uint handle) {
 			this.handle = handle;
+		}
+	}
+
+	public struct InjectorPayloadId {
+		public uint handle {
+			get;
+			private set;
+		}
+
+		public InjectorPayloadId (uint handle) {
+			this.handle = handle;
+		}
+	}
+
+	public struct MappedLibraryBlob {
+		public uint64 address {
+			get;
+			private set;
+		}
+
+		public uint size {
+			get;
+			private set;
+		}
+
+		public uint allocated_size {
+			get;
+			private set;
+		}
+
+		public MappedLibraryBlob (uint64 address, uint size, uint allocated_size) {
+			this.address = address;
+			this.size = size;
+			this.allocated_size = allocated_size;
 		}
 	}
 

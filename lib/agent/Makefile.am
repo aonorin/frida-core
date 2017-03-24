@@ -1,18 +1,17 @@
 extra_libs =
 extra_ldflags =
 
-if OS_ANDROID
-extra_libs += -llog
-endif
-
+if OS_DARWIN
+extra_ldflags += -export-symbols-regex "^frida_agent_main$$" -Wl,-dead_strip_dylibs
+else
 if OS_LINUX
 extra_ldflags += -Wl,--version-script -Wl,$(srcdir)/frida-agent.version
 else
 if OS_QNX
 extra_ldflags += -Wl,--version-script -Wl,$(srcdir)/frida-agent.version
-extra_libs += -lm
 else
 extra_ldflags += -export-symbols-regex "^frida_agent_main$$"
+endif
 endif
 endif
 
@@ -67,7 +66,8 @@ libfrida_agent_container_la_SOURCES = \
 libfrida_agent_container_la_CFLAGS = \
 	-w
 libfrida_agent_container_la_LIBADD = \
-	$(top_builddir)/lib/interfaces/libfrida-interfaces.la
+	$(top_builddir)/lib/interfaces/libfrida-interfaces.la \
+	$(top_builddir)/lib/pipe/libfrida-pipe.la
 libfrida_agent_container_la_VALAFLAGS = \
 	--vapi=frida-agent-container.vapi \
 	--library=frida-agent-container \

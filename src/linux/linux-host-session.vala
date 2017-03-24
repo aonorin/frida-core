@@ -65,8 +65,8 @@ namespace Frida {
 			return yield this.host_session.obtain_agent_session (agent_session_id);
 		}
 
-		private void on_agent_session_closed (AgentSessionId id, AgentSession session) {
-			agent_session_closed (id);
+		private void on_agent_session_closed (AgentSessionId id, AgentSession session, SessionDetachReason reason) {
+			agent_session_closed (id, reason);
 		}
 	}
 
@@ -74,7 +74,6 @@ namespace Frida {
 		private AgentContainer system_session_container;
 
 		private HelperProcess helper;
-		private Linjector injector;
 		private AgentResource agent;
 
 #if ANDROID
@@ -82,10 +81,14 @@ namespace Frida {
 		private RoboAgent robo_agent;
 #endif
 
+		private Gee.HashMap<uint, uint> injectee_by_pid = new Gee.HashMap<uint, uint> ();
+
 		construct {
 			helper = new HelperProcess ();
 			helper.output.connect (on_output);
+
 			injector = new Linjector.with_helper (helper);
+			injector.uninjected.connect (on_uninjected);
 
 			var blob32 = Frida.Data.Agent.get_frida_agent_32_so_blob ();
 			var blob64 = Frida.Data.Agent.get_frida_agent_64_so_blob ();
@@ -113,11 +116,15 @@ namespace Frida {
 			robo_agent = null;
 #endif
 
+			var linjector = injector as Linjector;
+
 			var uninjected_handler = injector.uninjected.connect ((id) => close.callback ());
-			while (injector.any_still_injected ())
+			while (linjector.any_still_injected ())
 				yield;
 			injector.disconnect (uninjected_handler);
-			yield injector.close ();
+
+			injector.uninjected.disconnect (on_uninjected);
+			yield linjector.close ();
 			injector = null;
 
 			yield helper.close ();
@@ -131,9 +138,13 @@ namespace Frida {
 		}
 
 		protected override async AgentSessionProvider create_system_session_provider (out DBusConnection connection) throws Error {
+			PipeTransport.set_temp_directory (helper.tempdir.path);
+
 			var agent_filename = agent.path_template.printf (sizeof (void *) == 8 ? 64 : 32);
 			system_session_container = yield AgentContainer.create (agent_filename);
+
 			connection = system_session_container.connection;
+
 			return system_session_container;
 		}
 
@@ -235,15 +246,24 @@ namespace Frida {
 			}
 #endif
 
-			yield injector.inject (pid, agent, t.remote_address);
+			var uninjected_handler = injector.uninjected.connect ((id) => perform_attach_to.callback ());
+			while (injectee_by_pid.has_key (pid))
+				yield;
+			injector.disconnect (uninjected_handler);
+
+			var linjector = injector as Linjector;
+			var id = yield linjector.inject_library_resource (pid, agent, "frida_agent_main", t.remote_address);
+			injectee_by_pid[pid] = id;
+
 			transport = t;
+
 			return pipe;
 		}
 
 #if ANDROID
 		private RoboLauncher get_robo_launcher () {
 			if (robo_launcher == null) {
-				robo_launcher = new RoboLauncher (robo_agent, helper, injector, agent);
+				robo_launcher = new RoboLauncher (robo_agent, helper, injector as Linjector, agent);
 				robo_launcher.spawned.connect ((info) => { spawned (info); });
 			}
 			return robo_launcher;
@@ -252,6 +272,17 @@ namespace Frida {
 
 		private void on_output (uint pid, int fd, uint8[] data) {
 			output (pid, fd, data);
+		}
+
+		private void on_uninjected (uint id) {
+			foreach (var entry in injectee_by_pid.entries) {
+				if (entry.value == id) {
+					injectee_by_pid.unset (entry.key);
+					return;
+				}
+			}
+
+			uninjected (InjectorPayloadId (id));
 		}
 	}
 
@@ -419,14 +450,14 @@ namespace Frida {
 
 			try {
 				if (should_inject_32bit_loader) {
-					loader32 = yield injector.inject (LocalProcesses.get_pid ("zygote"), loader, data_dir);
+					loader32 = yield injector.inject_library_resource (LocalProcesses.get_pid ("zygote"), loader, "frida_agent_main", data_dir);
 					pending.add (loader32);
 				}
 
 				if (should_inject_64bit_loader) {
 					var zygote64_pid = LocalProcesses.find_pid ("zygote64");
 					if (zygote64_pid != 0) {
-						loader64 = yield injector.inject (zygote64_pid, loader, data_dir);
+						loader64 = yield injector.inject_library_resource (zygote64_pid, loader, "frida_agent_main", data_dir);
 						pending.add (loader64);
 					} else {
 						loader64 = 1;
@@ -721,7 +752,7 @@ namespace Frida {
 
 		private async void post_call_request (string request, PendingResponse response, AgentSession session, AgentScriptId script) {
 			try {
-				yield session.post_message_to_script (script, request);
+				yield session.post_to_script (script, request, false, new uint8[0]);
 			} catch (GLib.Error e) {
 				response.complete_with_error (Marshal.from_dbus (e));
 			}
@@ -748,7 +779,7 @@ namespace Frida {
 			script = cached_script;
 		}
 
-		private void on_message_from_script (AgentScriptId sid, string raw_message, uint8[] data) {
+		private void on_message_from_script (AgentScriptId sid, string raw_message, bool has_data, uint8[] data) {
 			if (sid != cached_script)
 				return;
 

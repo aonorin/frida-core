@@ -14,7 +14,7 @@ namespace Frida.Gadget {
 	private Env env = Env.PRODUCTION;
 	private ScriptRunner script_runner;
 	private Server server;
-	private AutoIgnorer ignorer;
+	private Gum.Exceptor exceptor;
 	private Mutex mutex;
 	private Cond cond;
 
@@ -45,8 +45,6 @@ namespace Frida.Gadget {
 			return;
 		loaded = false;
 
-		var ign = ignorer;
-
 		{
 			var source = new IdleSource ();
 			source.set_callback (() => {
@@ -62,7 +60,7 @@ namespace Frida.Gadget {
 		mutex.unlock ();
 
 		if (env == Env.DEVELOPMENT)
-			Environment.deinit ((owned) ign);
+			Environment.deinit ();
 	}
 
 	public void resume () {
@@ -74,19 +72,24 @@ namespace Frida.Gadget {
 
 	private async void start () {
 		var gadget_range = memory_range ();
+		Gum.Cloak.add_range (gadget_range);
+
+		Gum.Cloak.add_thread (Gum.Process.get_current_thread_id ());
+		Gum.MemoryRange stack;
+		if (Gum.Thread.try_get_range (out stack))
+			Gum.Cloak.add_range (stack);
 
 		var interceptor = Gum.Interceptor.obtain ();
+		interceptor.ignore_current_thread ();
 
-		ignorer = new AutoIgnorer (interceptor, gadget_range);
-		ignorer.enable ();
-		ignorer.ignore (Gum.Process.get_current_thread_id (), 0);
+		exceptor = Gum.Exceptor.obtain ();
 
 		if (GLib.Environment.get_variable ("FRIDA_GADGET_ENV") == "development") {
 			env = Env.DEVELOPMENT;
 		}
 
 		var script_file = GLib.Environment.get_variable ("FRIDA_GADGET_SCRIPT");
-		bool jit_enabled = GLib.Environment.get_variable ("FRIDA_GADGET_DISABLE_JIT") == null;
+		bool jit_enabled = GLib.Environment.get_variable ("FRIDA_GADGET_ENABLE_JIT") != null;
 		if (script_file != null) {
 			var r = new ScriptRunner (script_file, jit_enabled, gadget_range);
 			try {
@@ -121,9 +124,7 @@ namespace Frida.Gadget {
 				server = null;
 			}
 
-			ignorer.unignore (Gum.Process.get_current_thread_id (), 0);
-			ignorer.disable ();
-			ignorer = null;
+			exceptor = null;
 		}
 
 		mutex.lock ();
@@ -135,7 +136,7 @@ namespace Frida.Gadget {
 	private class ScriptRunner : Object {
 		private AgentScriptId script;
 		private string script_file;
-		private FileMonitor script_monitor;
+		private GLib.FileMonitor script_monitor;
 		private Source script_unchanged_timeout;
 		private ScriptEngine script_engine;
 		private bool load_in_progress = false;
@@ -266,7 +267,7 @@ namespace Frida.Gadget {
 
 		private async void post_call_request (string request, PendingResponse response) {
 			try {
-				script_engine.post_message_to_script (script, request);
+				script_engine.post_to_script (script, request);
 			} catch (GLib.Error e) {
 				response.complete_with_error (Marshal.from_dbus (e));
 			}
@@ -290,7 +291,7 @@ namespace Frida.Gadget {
 			script_unchanged_timeout = source;
 		}
 
-		private void on_message (AgentScriptId sid, string raw_message, uint8[] data) {
+		private void on_message (AgentScriptId sid, string raw_message, Bytes? data) {
 			var parser = new Json.Parser ();
 			try {
 				parser.load_from_data (raw_message);
@@ -441,10 +442,14 @@ namespace Frida.Gadget {
 			return new ScriptEngine (script_backend, gadget_range);
 		}
 
-		public void disable_jit () throws Error {
+		public void enable_jit () throws Error {
+			if (jit_enabled)
+				return;
+
 			if (script_backend != null)
-				throw new Error.INVALID_OPERATION ("JIT may only be disabled before the first script is created");
-			jit_enabled = false;
+				throw new Error.INVALID_OPERATION ("JIT may only be enabled before the first script is created");
+
+			jit_enabled = true;
 		}
 
 		private void on_connection_closed (DBusConnection connection, bool remote_peer_vanished, GLib.Error? error) {
@@ -473,7 +478,7 @@ namespace Frida.Gadget {
 					assert_not_reached ();
 				}
 
-				var pid = Posix.getpid ();
+				var pid = _getpid ();
 				var identifier = "re.frida.Gadget";
 				var name = "Gadget";
 				var no_icon = ImageData (0, 0, 0, "");
@@ -552,7 +557,7 @@ namespace Frida.Gadget {
 				} catch (GLib.Error e) {
 				}
 
-				Posix.kill ((Posix.pid_t) this_process.pid, Posix.SIGKILL);
+				_kill (this_process.pid);
 			}
 
 			public async AgentSessionId attach_to (uint pid) throws Error {
@@ -575,6 +580,14 @@ namespace Frida.Gadget {
 				}
 
 				return id;
+			}
+
+			public async InjectorPayloadId inject_library_file (uint pid, string path, string entrypoint, string data) throws Error {
+				throw new Error.NOT_SUPPORTED ("Unable to inject libraries when embedded");
+			}
+
+			public async InjectorPayloadId inject_library_blob (uint pid, uint8[] blob, string entrypoint, string data) throws Error {
+				throw new Error.NOT_SUPPORTED ("Unable to inject libraries when embedded");
 			}
 
 			private void on_session_closed (ClientSession session) {
@@ -667,8 +680,8 @@ namespace Frida.Gadget {
 				yield engine.load_script (sid);
 			}
 
-			public async void post_message_to_script (AgentScriptId sid, string message) throws Error {
-				get_script_engine ().post_message_to_script (sid, message);
+			public async void post_to_script (AgentScriptId sid, string message, bool has_data, uint8[] data) throws Error {
+				get_script_engine ().post_to_script (sid, message, has_data ? new Bytes (data) : null);
 			}
 
 			public async void enable_debugger () throws Error {
@@ -683,8 +696,8 @@ namespace Frida.Gadget {
 				get_script_engine ().post_message_to_debugger (message);
 			}
 
-			public async void disable_jit () throws GLib.Error {
-				server.disable_jit ();
+			public async void enable_jit () throws GLib.Error {
+				server.enable_jit ();
 			}
 
 			private ScriptEngine get_script_engine () throws Error {
@@ -692,7 +705,11 @@ namespace Frida.Gadget {
 
 				if (script_engine == null) {
 					script_engine = server.create_script_engine ();
-					script_engine.message_from_script.connect ((script_id, message, data) => this.message_from_script (script_id, message, data));
+					script_engine.message_from_script.connect ((script_id, message, data) => {
+						var has_data = data != null;
+						var data_param = has_data ? data.get_data () : new uint8[0];
+						this.message_from_script (script_id, message, has_data, data_param);
+					});
 					script_engine.message_from_debugger.connect ((message) => this.message_from_debugger (message));
 				}
 
@@ -704,41 +721,6 @@ namespace Frida.Gadget {
 					throw new Error.INVALID_OPERATION ("Session is closing");
 			}
 		}
-	}
-
-	protected class AutoIgnorer : Object {
-		protected Gum.Interceptor interceptor;
-		protected Gum.MemoryRange gadget_range;
-		protected SList tls_contexts;
-		protected Mutex mutex;
-
-		public AutoIgnorer (Gum.Interceptor interceptor, Gum.MemoryRange gadget_range) {
-			this.interceptor = interceptor;
-			this.gadget_range = gadget_range;
-		}
-
-		public void enable () {
-			replace_apis ();
-		}
-
-		public void disable () {
-			revert_apis ();
-		}
-
-		public void ignore (Gum.ThreadId agent_thread_id, Gum.ThreadId parent_thread_id) {
-			if (parent_thread_id != 0)
-				Gum.ScriptBackend.ignore (parent_thread_id);
-			Gum.ScriptBackend.ignore (agent_thread_id);
-		}
-
-		public void unignore (Gum.ThreadId agent_thread_id, Gum.ThreadId parent_thread_id) {
-			Gum.ScriptBackend.unignore (agent_thread_id);
-			if (parent_thread_id != 0)
-				Gum.ScriptBackend.unignore (parent_thread_id);
-		}
-
-		private extern void replace_apis ();
-		private extern void revert_apis ();
 	}
 
 	private Gum.MemoryRange memory_range () {
@@ -759,11 +741,49 @@ namespace Frida.Gadget {
 
 	namespace Environment {
 		private extern void init ();
-		private extern void deinit (owned AutoIgnorer ignorer);
+		private extern void deinit ();
 		private extern unowned MainContext get_main_context ();
 		private extern unowned Gum.ScriptBackend obtain_script_backend (bool jit_enabled);
 	}
 
+	public extern uint _getpid ();
+	public extern void _kill (uint pid);
+
 	private extern void log_info (string message);
 	private extern void log_error (string message);
+
+	private Mutex gc_mutex;
+	private uint gc_generation = 0;
+	private bool gc_scheduled = false;
+
+	public void on_pending_garbage (void * data) {
+		gc_mutex.lock ();
+		gc_generation++;
+		bool already_scheduled = gc_scheduled;
+		gc_scheduled = true;
+		gc_mutex.unlock ();
+
+		if (already_scheduled)
+			return;
+
+		Timeout.add (50, () => {
+			gc_mutex.lock ();
+			uint generation = gc_generation;
+			gc_mutex.unlock ();
+
+			bool collected_everything = garbage_collect ();
+
+			gc_mutex.lock ();
+			bool same_generation = generation == gc_generation;
+			bool repeat = !collected_everything || !same_generation;
+			if (!repeat)
+				gc_scheduled = false;
+			gc_mutex.unlock ();
+
+			return repeat;
+		});
+	}
+
+	[CCode (cname = "g_thread_garbage_collect")]
+	private extern bool garbage_collect ();
 }

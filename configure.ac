@@ -13,11 +13,13 @@ m4_ifdef([AM_SILENT_RULES], [AM_SILENT_RULES([yes])])
 AM_MAINTAINER_MODE
 
 AM_PROG_CC_C_O
+AC_USE_SYSTEM_EXTENSIONS
 AC_PROG_CXX
 AC_PROG_OBJC
 AM_PROG_AS
 AM_PROG_AR
 AM_PROG_VALAC([0.28.0])
+AC_CHECK_TOOL(OBJCOPY, objcopy)
 AC_PROG_INSTALL
 LT_INIT
 
@@ -70,7 +72,6 @@ case $host_os in
 esac
 if [[ "x$HAVE_LINUX" = "xyes" ]]; then
   AC_DEFINE(HAVE_LINUX, 1, [Define to 1 if OS is Linux based.])
-  AC_DEFINE(_GNU_SOURCE, 1, [Enable GNU extensions (required by Linux backend).])
 fi
 if [[ "x$HAVE_DARWIN" = "xyes" ]]; then
   AC_DEFINE(HAVE_DARWIN, 1, [Define to 1 if OS is Darwin based.])
@@ -221,7 +222,7 @@ PKG_CHECK_MODULES(FRIDA_TEST, [gmodule-2.0 >= $GLIB_VERSION])
 
 FRIDA_BACKEND_LIBS=
 if [[ "x$HAVE_DARWIN" = "xyes" ]]; then
-  FRIDA_BACKEND_LIBS="-Wl,-framework -Wl,Foundation"
+  FRIDA_BACKEND_LIBS="-Wl,-framework -Wl,Foundation -lbsm"
 fi
 if [[ "x$HAVE_MAC" = "xyes" ]]; then
   FRIDA_BACKEND_LIBS="$FRIDA_BACKEND_LIBS -Wl,-framework -Wl,AppKit"
@@ -240,6 +241,12 @@ AC_SUBST(FRIDA_PACKAGES)
 if [[ "x$HAVE_ANDROID" = "xyes" ]]; then
   PKG_CHECK_MODULES(FRIDA_LOADER, [frida-gum-1.0])
 fi
+
+FRIDA_CORE_INTERNAL="--pkg=frida-core"
+if [[ "x$HAVE_DARWIN" = "xyes" ]]; then
+  FRIDA_CORE_INTERNAL="$FRIDA_CORE_INTERNAL --vapidir=\$(abs_top_srcdir)/lib/pipe --pkg=frida-pipe --pkg=frida-helper-types --pkg=frida-helper-backend"
+fi
+AC_SUBST(FRIDA_CORE_INTERNAL)
 
 PKG_CHECK_MODULES(FRIDA_AGENT, [glib-2.0 >= $GLIB_VERSION, gobject-2.0 >= $GLIB_VERSION, gio-2.0 >= $GLIB_VERSION, gee-0.8 >= 0.5.2, frida-gum-1.0, frida-gumjs-1.0])
 FRIDA_AGENT_PACKAGES="--pkg gio-2.0 --pkg gee-0.8 --pkg frida-gum-1.0 --pkg frida-gumjs-1.0"

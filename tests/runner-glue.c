@@ -40,10 +40,8 @@ frida_test_environment_init (int * args_length1, char *** args)
 #if DEBUG_HEAP_LEAKS
   g_setenv ("G_SLICE", "always-malloc", TRUE);
 #endif
-#if GLIB_CHECK_VERSION (2, 46, 0)
   glib_init ();
   gio_init ();
-#endif
   g_test_init (args_length1, args, NULL);
   gum_init ();
   frida_error_quark (); /* Initialize early so GDBus will pick it up */
@@ -57,15 +55,12 @@ void
 frida_test_environment_deinit (void)
 {
 #if DEBUG_HEAP_LEAKS
-# if GLIB_CHECK_VERSION (2, 46, 0)
+  gum_shutdown ();
   gio_shutdown ();
   glib_shutdown ();
-# endif
   gum_deinit ();
-# if GLIB_CHECK_VERSION (2, 46, 0)
   gio_deinit ();
   glib_deinit ();
-# endif
 #endif
 
 #if defined (G_OS_WIN32) && !DEBUG_HEAP_LEAKS
@@ -83,7 +78,7 @@ frida_test_os (void)
 #if defined (G_OS_WIN32)
   return FRIDA_TEST_OS_WINDOWS;
 #elif defined (HAVE_MAC)
-  return FRIDA_TEST_OS_MAC;
+  return FRIDA_TEST_OS_MACOS;
 #elif defined (HAVE_IOS)
   return FRIDA_TEST_OS_IOS;
 #elif defined (HAVE_ANDROID)

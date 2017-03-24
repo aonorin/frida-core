@@ -3,6 +3,7 @@ RESOURCE_COMPILER = $(top_builddir)/tools/resource-compiler
 backend_programs = $(NULL)
 backend_libraries = $(NULL)
 backend_sources = $(NULL)
+backend_data = $(NULL)
 backend_libadd = $(NULL)
 backend_valaflags = $(NULL)
 backend_cleanfiles = $(NULL)
@@ -45,9 +46,10 @@ backend_sources += \
 glue_sources += \
 	linux/system-linux.c \
 	linux/linjector-glue.c
-backend_libadd += \
-	libfrida-helper-types.la \
+backend_data += \
 	libfrida-data-helper-process.la
+backend_libadd += \
+	libfrida-helper-types.la
 backend_valaflags += \
 	--pkg=frida-helper-types \
 	--pkg=frida-data-helper-process \
@@ -57,7 +59,7 @@ backend_valaflags += \
 if OS_ANDROID
 backend_libraries += \
 	libfrida-data-android.la
-backend_libadd += \
+backend_data += \
 	libfrida-data-android.la
 backend_valaflags += \
 	--pkg=frida-data-android
@@ -79,7 +81,7 @@ backend_cleanfiles += \
 
 backend_libraries += \
 	libfrida-data-loader.la
-backend_libadd += \
+backend_data += \
 	libfrida-data-loader.la
 backend_valaflags += \
 	--pkg=frida-data-loader
@@ -133,8 +135,6 @@ libfrida_helper_main_la_VALAFLAGS = \
 
 libfrida_helper_glue_la_SOURCES = \
 	linux/frida-helper-glue.c
-libfrida_helper_glue_la_LIBTOOLFLAGS = \
-	--tag=CC
 
 libfrida_helper_types_la_SOURCES = \
 	linux/frida-helper-types.vala
@@ -172,8 +172,6 @@ endif
 
 if OS_DARWIN
 HELPER = frida-helper
-LOADER ?= $(top_builddir)/lib/loader/.libs/libfrida-loader.dylib!FridaLoader.dylib
-LOADER_TARGETS = $(shell echo $(LOADER) | cut -f1 -d'!')
 AGENT ?= $(top_builddir)/lib/agent/.libs/libfrida-agent.dylib!frida-agent.dylib
 AGENT_TARGETS = $(shell echo $(AGENT) | cut -f1 -d'!')
 
@@ -188,20 +186,24 @@ backend_sources += \
 	darwin/darwin-host-session.vala \
 	darwin/fruitjector.vala \
 	darwin/frida-helper-process.vala
-glue_sources += \
+backend_data += \
+	libfrida-data-helper-process.la
+backend_libadd += \
+	libfrida-core-darwin.la \
+	libfrida-helper-backend.la
+backend_valaflags += \
+	--pkg=frida-helper-backend \
+	--pkg=frida-helper-types \
+	--pkg=frida-data-helper-process
+
+backend_libraries += \
+	libfrida-core-darwin.la
+libfrida_core_darwin_la_SOURCES = \
 	darwin/system-darwin.m \
 	darwin/darwin-host-session-glue.m \
 	darwin/icon-helpers.h \
 	darwin/icon-helpers.m \
 	$(springboard_sources)
-backend_libadd += \
-	libfrida-helper-types.la \
-	libfrida-data-helper-process.la \
-	libfrida-data-loader.la
-backend_valaflags += \
-	--pkg=frida-helper-types \
-	--pkg=frida-data-helper-process \
-	--pkg=frida-data-loader
 
 backend_programs += \
 	frida-helper
@@ -210,9 +212,9 @@ frida_helper_SOURCES = \
 frida_helper_LDFLAGS = \
 	$(FRIDA_LDFLAGS)
 frida_helper_LDADD = \
-	libfrida-helper-main.la \
-	libfrida-helper-glue.la \
-	$(top_builddir)/lib/pipe/libfrida-pipe.la \
+	libfrida-helper-backend.la \
+	libfrida-helper-service.la \
+	libfrida-helper-service-darwin.la \
 	$(FRIDA_LIBS)
 if OS_MAC
 frida_helper_LDFLAGS += \
@@ -220,36 +222,30 @@ frida_helper_LDFLAGS += \
 endif
 
 backend_libraries += \
-	libfrida-helper-types.la \
-	libfrida-helper-main.la \
-	libfrida-helper-glue.la
+	libfrida-helper-backend.la \
+	libfrida-helper-backend-glue.la \
+	libfrida-helper-service.la \
+	libfrida-helper-service-darwin.la \
+	libfrida-helper-types.la
 
-libfrida_helper_main_la_SOURCES = \
-	darwin/frida-helper.vala
-libfrida_helper_main_la_CFLAGS = \
+libfrida_helper_service_la_SOURCES = \
+	darwin/frida-helper-service.vala
+libfrida_helper_service_la_CFLAGS = \
 	-w
-libfrida_helper_main_la_LIBADD = \
-	libfrida-helper-types.la \
-	$(top_builddir)/lib/agent/libfrida-agent-container.la \
-	$(FRIDA_LIBS)
-libfrida_helper_main_la_VALAFLAGS = \
-	--header=frida-helper.h \
+libfrida_helper_service_la_VALAFLAGS = \
+	--header=frida-helper-service.h \
 	--vapidir=$(abs_top_srcdir)/lib/interfaces \
 	--vapidir=$(abs_top_srcdir)/lib/pipe \
-	--vapidir=$(abs_top_srcdir)/lib/agent \
 	--vapidir=$(abs_srcdir) \
+	--pkg=frida-helper-backend \
+	--pkg=frida-helper-types \
 	--pkg=frida-interfaces \
 	--pkg=frida-pipe \
-	--pkg=frida-agent-container \
-	--pkg=frida-helper-types \
 	@FRIDA_PACKAGES@ \
 	@FRIDA_VALAFLAGS@
 
-libfrida_helper_glue_la_SOURCES = \
-	darwin/frida-helper-glue.m \
-	$(springboard_sources)
-libfrida_helper_glue_la_LIBTOOLFLAGS = \
-	--tag=CC
+libfrida_helper_service_darwin_la_SOURCES = \
+	darwin/frida-helper-service-glue.m
 
 libfrida_helper_types_la_SOURCES = \
 	darwin/frida-helper-types.vala
@@ -265,6 +261,36 @@ libfrida_helper_types_la_VALAFLAGS = \
 	--pkg=frida-interfaces \
 	@FRIDA_PACKAGES@ \
 	@FRIDA_VALAFLAGS@
+
+libfrida_helper_backend_la_SOURCES = \
+	darwin/frida-helper-backend.vala \
+	darwin/port.vala
+libfrida_helper_backend_la_CFLAGS = \
+	-w
+libfrida_helper_backend_la_LIBADD = \
+	libfrida-helper-backend-glue.la \
+	libfrida-helper-types.la \
+	$(top_builddir)/lib/agent/libfrida-agent-container.la \
+	$(FRIDA_LIBS)
+libfrida_helper_backend_la_VALAFLAGS = \
+	--vapi=frida-helper-backend.vapi \
+	--library=frida-helper-backend \
+	--header=frida-helper-backend.h \
+	--vapidir=$(abs_top_srcdir)/lib/interfaces \
+	--vapidir=$(abs_top_srcdir)/lib/pipe \
+	--vapidir=$(abs_top_srcdir)/lib/agent \
+	--vapidir=$(abs_srcdir) \
+	--pkg=frida-interfaces \
+	--pkg=frida-pipe \
+	--pkg=frida-agent-container \
+	--pkg=frida-helper-types \
+	@FRIDA_PACKAGES@ \
+	@FRIDA_VALAFLAGS@
+
+libfrida_helper_backend_glue_la_SOURCES = \
+	darwin/frida-helper-backend-glue.m \
+	darwin/port-glue.m \
+	$(springboard_sources)
 
 frida-helper.stamp: frida-helper
 if OS_MAC
@@ -294,17 +320,26 @@ backend_cleanfiles += \
 	frida-data-helper-process-blob.S
 
 backend_libraries += \
-	libfrida-data-loader.la
-libfrida_data_loader_la_SOURCES = \
-	frida-data-loader.c \
-	frida-data-loader-blob.S \
+	libfrida-data-darwin.la
+backend_data += \
+	libfrida-data-darwin.la
+backend_valaflags += \
+	--pkg=frida-data-darwin
+libfrida_data_darwin_la_SOURCES = \
+	frida-data-darwin.c \
+	frida-data-darwin-blob.S \
 	$(NULL)
-frida-data-loader.c frida-data-loader-blob.S: $(LOADER_TARGETS)
+frida-data-darwin.c frida-data-darwin-blob.S: darwin/agent/launchd.js darwin/agent/xpcproxy.js
 	$(AM_V_GEN) \
 		$(RESOURCE_COMPILER) \
-			-c "$(srcdir)/loader.resources" \
-			-o "$(builddir)/frida-data-loader" \
-			$(LOADER)
+			-c "$(srcdir)/darwin/frida-darwin.resources" \
+			-o "$(builddir)/frida-data-darwin" \
+			$^
+backend_cleanfiles += \
+	frida-data-darwin.vapi \
+	frida-data-darwin.h \
+	frida-data-darwin.c \
+	frida-data-darwin-blob.S
 endif
 
 if OS_QNX
@@ -324,7 +359,7 @@ backend_sources += \
 	fruity/fruity-host-session.vala \
 	fruity/fruity-property-list.vala
 if OS_DARWIN
-glue_sources += fruity/fruity-host-session-darwin.m
+libfrida_core_darwin_la_SOURCES += fruity/fruity-host-session-darwin.m
 else
 glue_sources += fruity/fruity-host-session-unix.c
 endif
@@ -340,10 +375,10 @@ lib_LTLIBRARIES = \
 noinst_PROGRAMS = \
 	$(backend_programs)
 noinst_LTLIBRARIES = \
-	$(backend_libraries) \
-	libfrida-data-agent.la \
 	libfrida-core.la \
-	libfrida-core-glue.la
+	libfrida-core-glue.la \
+	$(backend_libraries) \
+	libfrida-data-agent.la
 
 fridacoreincludedir = $(includedir)/frida-1.0
 fridacoreinclude_HEADERS = \
@@ -366,14 +401,16 @@ libfrida_core_1_0_la_LIBADD = \
 	$(top_builddir)/lib/pipe/libfrida-pipe.la \
 	$(top_builddir)/lib/agent/libfrida-agent-container.la \
 	libfrida-data-agent.la \
-	$(backend_libadd) \
+	$(backend_data) \
 	libfrida-core.la \
-	libfrida-core-glue.la
+	libfrida-core-glue.la \
+	$(backend_libadd)
 libfrida_core_1_0_la_LIBTOOLFLAGS = \
 	--tag=disable-shared
 
 libfrida_core_la_SOURCES = \
 	frida.vala \
+	debugger.vala \
 	host-session-service.vala \
 	$(backend_sources) \
 	tcp/tcp-host-session.vala \
@@ -402,8 +439,6 @@ libfrida_core_la_VALAFLAGS = \
 libfrida_core_glue_la_SOURCES = \
 	frida-glue.c \
 	$(glue_sources)
-libfrida_core_glue_la_LIBTOOLFLAGS = \
-	--tag=CC
 
 AM_CPPFLAGS = \
 	-DG_LOG_DOMAIN=\"Frida\" \

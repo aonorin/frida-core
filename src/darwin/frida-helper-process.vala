@@ -1,20 +1,25 @@
 #if DARWIN
 namespace Frida {
-	internal class HelperProcess {
-		public signal void output (uint pid, int fd, uint8[] data);
-		public signal void uninjected (uint id);
+	public class DarwinHelperProcess : Object, DarwinHelper {
+		public uint pid {
+			get {
+				if (process == null)
+					return 0;
+
+				return (uint) uint64.parse (process.get_identifier ());
+			}
+		}
 
 		public TemporaryDirectory tempdir {
-			get {
-				return resource_store.tempdir;
-			}
+			get;
+			construct;
 		}
 
 		private ResourceStore resource_store {
 			get {
 				if (_resource_store == null) {
 					try {
-						_resource_store = new ResourceStore ();
+						_resource_store = new ResourceStore (tempdir);
 					} catch (Error e) {
 						assert_not_reached ();
 					}
@@ -26,26 +31,40 @@ namespace Frida {
 
 		private MainContext main_context;
 		private Subprocess process;
+		private TaskPort task;
 		private DBusConnection connection;
-		private Helper proxy;
-		private Gee.Promise<Helper> obtain_request;
+		private DarwinRemoteHelper proxy;
+		private Gee.Promise<DarwinRemoteHelper> obtain_request;
 
-		public HelperProcess () {
-			this.main_context = MainContext.get_thread_default ();
+		public DarwinHelperProcess (TemporaryDirectory tempdir) {
+			Object (tempdir: tempdir);
+		}
+
+		construct {
+			main_context = MainContext.get_thread_default ();
 		}
 
 		public async void close () {
+			var proc = process;
+
 			if (proxy != null) {
 				try {
 					yield proxy.stop ();
-				} catch (GLib.Error proxy_error) {
+				} catch (GLib.Error e) {
 				}
 			}
 
 			if (connection != null) {
 				try {
 					yield connection.close ();
-				} catch (GLib.Error connection_error) {
+				} catch (GLib.Error e) {
+				}
+			}
+
+			if (proc != null) {
+				try {
+					yield proc.wait_async ();
+				} catch (GLib.Error e) {
 				}
 			}
 
@@ -54,18 +73,6 @@ namespace Frida {
 
 		public async void preload () throws Error {
 			yield obtain ();
-		}
-
-		public async AgentSessionProvider create_system_session_provider (string agent_filename, out DBusConnection conn) throws Error {
-			var helper = yield obtain ();
-			try {
-				var provider_path = yield helper.create_system_session_provider (agent_filename);
-				AgentSessionProvider provider = yield connection.get_proxy (null, provider_path);
-				conn = connection;
-				return provider;
-			} catch (GLib.Error e) {
-				throw Marshal.from_dbus (e);
-			}
 		}
 
 		public async uint spawn (string path, string[] argv, string[] envp) throws Error {
@@ -100,6 +107,15 @@ namespace Frida {
 			}
 		}
 
+		public async void wait_until_suspended (uint pid) throws Error {
+			var helper = yield obtain ();
+			try {
+				yield helper.wait_until_suspended (pid);
+			} catch (GLib.Error e) {
+				throw Marshal.from_dbus (e);
+			}
+		}
+
 		public async void resume (uint pid) throws Error {
 			var helper = yield obtain ();
 			try {
@@ -127,10 +143,19 @@ namespace Frida {
 			}
 		}
 
-		public async uint inject (uint pid, string filename, string data_string) throws Error {
+		public async uint inject_library_file (uint pid, string path, string entrypoint, string data) throws Error {
 			var helper = yield obtain ();
 			try {
-				return yield helper.inject (pid, filename, data_string);
+				return yield helper.inject_library_file (pid, path, entrypoint, data);
+			} catch (GLib.Error e) {
+				throw Marshal.from_dbus (e);
+			}
+		}
+
+		public async uint inject_library_blob (uint pid, string name, MappedLibraryBlob blob, string entrypoint, string data) throws Error {
+			var helper = yield obtain ();
+			try {
+				return yield helper.inject_library_blob (pid, name, blob, entrypoint, data);
 			} catch (GLib.Error e) {
 				throw Marshal.from_dbus (e);
 			}
@@ -139,22 +164,26 @@ namespace Frida {
 		public async IOStream make_pipe_stream (uint remote_pid, out string remote_address) throws Error {
 			var helper = yield obtain ();
 			try {
-				var endpoints = yield helper.make_pipe_endpoints ((uint) Posix.getpid (), remote_pid);
-				var local_address = endpoints.local_address;
+				var endpoints = yield helper.make_pipe_endpoints (remote_pid);
+
 				remote_address = endpoints.remote_address;
-				if (local_address[0] == '/') {
-					TunneledStream ts;
-					ts = yield connection.get_proxy (null, local_address);
-					return new SimpleIOStream (TunneledInputStream.create (ts), TunneledOutputStream.create (ts));
-				} else {
-					return new Pipe (local_address);
-				}
+
+				return new Pipe (endpoints.local_address);
 			} catch (GLib.Error e) {
 				throw Marshal.from_dbus (e);
 			}
 		}
 
-		private async Helper obtain () throws Error {
+		public async MappedLibraryBlob? try_mmap (Bytes blob) throws Error {
+			if (!DarwinHelperBackend.is_mmap_available ())
+				return null;
+
+			yield obtain ();
+
+			return DarwinHelperBackend.mmap (task.mach_port, blob);
+		}
+
+		private async DarwinRemoteHelper obtain () throws Error {
 			if (obtain_request != null) {
 				try {
 					return yield obtain_request.future.wait_async ();
@@ -162,54 +191,35 @@ namespace Frida {
 					throw new Error.INVALID_OPERATION (future_error.message);
 				}
 			}
-			obtain_request = new Gee.Promise<Helper> ();
+			obtain_request = new Gee.Promise<DarwinRemoteHelper> ();
 
 			Subprocess pending_process = null;
+			TaskPort pending_task_port = null;
 			DBusConnection pending_connection = null;
-			Helper pending_proxy = null;
+			DarwinRemoteHelper pending_proxy = null;
 			Error pending_error = null;
 
-			DBusServer server = null;
-			TimeoutSource timeout_source = null;
+			var service_name = make_service_name ();
 
 			try {
-				server = new DBusServer.sync ("unix:tmpdir=" + resource_store.tempdir.path, DBusServerFlags.AUTHENTICATION_ALLOW_ANONYMOUS, DBus.generate_guid ());
-				server.start ();
-				var tokens = server.client_address.split ("=", 2);
-				resource_store.pipe = new TemporaryFile (File.new_for_path (tokens[1]), resource_store.tempdir);
-				var connection_handler = server.new_connection.connect ((c) => {
-					pending_connection = c;
-					obtain.callback ();
-					return true;
-				});
-				timeout_source = new TimeoutSource.seconds (2);
-				timeout_source.set_callback (() => {
-					pending_error = new Error.TIMED_OUT ("Unexpectedly timed out while spawning helper process");
-					obtain.callback ();
-					return false;
-				});
-				timeout_source.attach (main_context);
-				string[] argv = { resource_store.helper.path, server.client_address };
-				pending_process = new Subprocess.newv (argv, SubprocessFlags.STDIN_INHERIT);
-				yield;
-				server.disconnect (connection_handler);
-				server.stop ();
-				server = null;
-				timeout_source.destroy ();
-				timeout_source = null;
+				var handshake_port = new HandshakePort.local (service_name);
 
-				if (pending_error == null)
-					pending_proxy = yield pending_connection.get_proxy (null, ObjectPath.HELPER);
+				string[] argv = { resource_store.helper.path, service_name };
+				pending_process = new Subprocess.newv (argv, SubprocessFlags.STDIN_INHERIT);
+
+				var peer_pid = (uint) uint64.parse (pending_process.get_identifier ());
+				Pipe pipe;
+				yield handshake_port.exchange (peer_pid, out pending_task_port, out pipe);
+
+				pending_connection = yield new DBusConnection (pipe, null, DBusConnectionFlags.NONE, null, null);
+				pending_proxy = yield pending_connection.get_proxy (null, ObjectPath.HELPER);
 			} catch (GLib.Error e) {
-				if (timeout_source != null)
-					timeout_source.destroy ();
-				if (server != null)
-					server.stop ();
 				pending_error = new Error.PERMISSION_DENIED (e.message);
 			}
 
 			if (pending_error == null) {
 				process = pending_process;
+				task = pending_task_port;
 
 				connection = pending_connection;
 				connection.closed.connect (on_connection_closed);
@@ -229,6 +239,17 @@ namespace Frida {
 			}
 		}
 
+		private static string make_service_name () {
+			var builder = new StringBuilder ("re.frida.Helper");
+
+			builder.append_printf (".%d.", Posix.getpid ());
+
+			for (var i = 0; i != 16; i++)
+				builder.append_printf ("%02x", Random.int_range (0, 256));
+
+			return builder.str;
+		}
+
 		private void on_connection_closed (bool remote_peer_vanished, GLib.Error? error) {
 			obtain_request = null;
 
@@ -240,6 +261,7 @@ namespace Frida {
 			connection = null;
 
 			process = null;
+			task = null;
 		}
 
 		private void on_output (uint pid, int fd, uint8[] data) {
@@ -252,24 +274,14 @@ namespace Frida {
 	}
 
 	private class ResourceStore {
-		public TemporaryDirectory tempdir {
-			get;
-			private set;
-		}
-
 		public TemporaryFile helper {
 			get;
 			private set;
 		}
 
-		public TemporaryFile pipe {
-			get;
-			set;
-		}
-
-		public ResourceStore () throws Error {
-			tempdir = new TemporaryDirectory ();
+		public ResourceStore (TemporaryDirectory tempdir) throws Error {
 			FileUtils.chmod (tempdir.path, 0755);
+
 			var blob = Frida.Data.Helper.get_frida_helper_blob ();
 			helper = new TemporaryFile.from_stream ("frida-helper",
 				new MemoryInputStream.from_data (blob.data, null),
@@ -278,106 +290,8 @@ namespace Frida {
 		}
 
 		~ResourceStore () {
-			if (pipe != null)
-				pipe.destroy ();
 			helper.destroy ();
-			tempdir.destroy ();
 		}
-	}
-
-	namespace TunneledInputStream {
-		private InputStream create (TunneledStream stream) {
-			var pipe = new LocalUnixPipe ();
-			process.begin (stream, pipe);
-			return pipe.input;
-		}
-
-		private async void process (TunneledStream stream, LocalUnixPipe pipe) {
-			var output = pipe.output;
-
-			while (true) {
-				uint8[] chunk;
-				try {
-					chunk = yield stream.read ();
-				} catch (GLib.Error e) {
-					output.close_async.begin ();
-					return;
-				}
-				if (chunk.length == 0) {
-					output.close_async.begin ();
-					return;
-				}
-				try {
-					yield output.write_all_async (chunk, Priority.DEFAULT, null, null);
-				} catch (GLib.Error e) {
-					stream.close.begin ();
-					return;
-				}
-			}
-		}
-	}
-
-	namespace TunneledOutputStream {
-		private OutputStream create (TunneledStream stream) {
-			var pipe = new LocalUnixPipe ();
-			process.begin (stream, pipe);
-			return pipe.output;
-		}
-
-		private async void process (TunneledStream stream, LocalUnixPipe pipe) {
-			var input = pipe.input;
-
-			var buf = new uint8[4096];
-			while (true) {
-				ssize_t n;
-				try {
-					n = yield input.read_async (buf);
-				} catch (GLib.Error e) {
-					stream.close.begin ();
-					return;
-				}
-				if (n == 0) {
-					stream.close.begin ();
-					return;
-				}
-				try {
-					yield stream.write (buf[0:n]);
-				} catch (GLib.Error e) {
-					input.close_async.begin ();
-					return;
-				}
-			}
-		}
-	}
-
-	private class LocalUnixPipe {
-		public UnixInputStream input {
-			get;
-			private set;
-		}
-
-		public UnixOutputStream output {
-			get;
-			private set;
-		}
-
-		public LocalUnixPipe () {
-			var fds = new int[2];
-			try {
-				open_pipe (fds, 0);
-				Unix.set_fd_nonblocking (fds[0], true);
-				Unix.set_fd_nonblocking (fds[1], true);
-			} catch (GLib.Error e) {
-				assert_not_reached ();
-			}
-
-			input = new UnixInputStream (fds[0], true);
-			output = new UnixOutputStream (fds[1], true);
-		}
-
-		/* FIXME: working around vapi bug */
-		[CCode (cheader_filename = "glib-unix.h", cname = "g_unix_open_pipe")]
-		public static extern bool open_pipe (int * fds, int flags) throws GLib.Error;
 	}
 }
 #endif

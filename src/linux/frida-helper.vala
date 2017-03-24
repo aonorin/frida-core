@@ -18,6 +18,7 @@ namespace Frida {
 
 		private MainLoop loop = new MainLoop ();
 		private int run_result = 0;
+		private Gee.Promise<bool> shutdown_request;
 
 		private DBusConnection connection;
 		private uint registration_id = 0;
@@ -26,7 +27,7 @@ namespace Frida {
 		/* these should be private, but must be accessible to glue code */
 		public Gee.HashMap<uint, void *> spawn_instance_by_pid = new Gee.HashMap<uint, void *> ();
 		public Gee.HashMap<uint, void *> inject_instance_by_id = new Gee.HashMap<uint, void *> ();
-		public uint last_id = 0;
+		public uint next_id = 0;
 
 		public HelperService (string parent_address) {
 			Object (parent_address: parent_address);
@@ -51,6 +52,16 @@ namespace Frida {
 		}
 
 		private async void shutdown () {
+			if (shutdown_request != null) {
+				try {
+					yield shutdown_request.future.wait_async ();
+				} catch (Gee.FutureError e) {
+					assert_not_reached ();
+				}
+				return;
+			}
+			shutdown_request = new Gee.Promise<bool> ();
+
 			if (connection != null) {
 				if (registration_id != 0)
 					connection.unregister_object (registration_id);
@@ -62,12 +73,17 @@ namespace Frida {
 				connection = null;
 			}
 
-			loop.quit ();
+			shutdown_request.set_value (true);
+
+			Idle.add (() => {
+				loop.quit ();
+				return false;
+			});
 		}
 
 		private async void start () {
 			try {
-				connection = yield DBusConnection.new_for_address (parent_address, DBusConnectionFlags.AUTHENTICATION_CLIENT | DBusConnectionFlags.DELAY_MESSAGE_PROCESSING);
+				connection = yield new DBusConnection.for_address (parent_address, DBusConnectionFlags.AUTHENTICATION_CLIENT | DBusConnectionFlags.DELAY_MESSAGE_PROCESSING);
 				connection.closed.connect (on_connection_closed);
 				Helper helper = this;
 				registration_id = connection.register_object (Frida.ObjectPath.HELPER, helper);
@@ -118,7 +134,7 @@ namespace Frida {
 				if (n > 0)
 					process_next_output_from.begin (stream, pid, fd, resource);
 			} catch (GLib.Error e) {
-				output (pid, fd, new uint8[0] {});
+				output (pid, fd, new uint8[0]);
 			}
 		}
 
@@ -143,8 +159,8 @@ namespace Frida {
 			Posix.kill ((Posix.pid_t) pid, Posix.SIGKILL);
 		}
 
-		public async uint inject (uint pid, string filename, string data_string, string temp_path) throws Error {
-			var id = _do_inject (pid, filename, data_string, temp_path);
+		public async uint inject_library_file (uint pid, string path, string entrypoint, string data, string temp_path) throws Error {
+			var id = _do_inject (pid, path, entrypoint, data, temp_path);
 
 			var fifo = _get_fifo_for_inject_instance (inject_instance_by_id[id]);
 			var buf = new uint8[1];
@@ -165,7 +181,7 @@ namespace Frida {
 			Source.remove (timeout);
 			if (size == 0) {
 				Idle.add (() => {
-					_on_uninject (id);
+					_on_uninject (id, false);
 					return false;
 				});
 			} else {
@@ -180,6 +196,7 @@ namespace Frida {
 			if (instance == null)
 				return;
 			var fifo = _get_fifo_for_inject_instance (instance);
+			var is_resident = false;
 			while (true) {
 				var buf = new uint8[1];
 				try {
@@ -190,35 +207,44 @@ namespace Frida {
 						 * Should consider to instead signal the remote thread id and poll /proc until it's gone.
 						 */
 						Timeout.add (50, () => {
-							_on_uninject (id);
+							_on_uninject (id, is_resident);
 							return false;
 						});
 						return;
+					} else {
+						is_resident = (bool) buf[0];
 					}
 				} catch (IOError e) {
-					_on_uninject (id);
+					_on_uninject (id, false);
 					return;
 				}
 			}
 		}
 
-		private void _on_uninject (uint id) {
+		private void _on_uninject (uint id, bool is_resident) {
 			void * instance;
 			bool found = inject_instance_by_id.unset (id, out instance);
 			assert (found);
+
 			_free_inject_instance (instance);
-			uninjected (id);
+
+			if (!is_resident)
+				uninjected (id);
+
+			if (connection.is_closed () && inject_instance_by_id.is_empty)
+				shutdown.begin ();
 		}
 
 		private void on_connection_closed (bool remote_peer_vanished, GLib.Error? error) {
-			shutdown.begin ();
+			if (inject_instance_by_id.is_empty)
+				shutdown.begin ();
 		}
 
 		public extern uint _do_spawn (string path, string[] argv, string[] envp, out StdioPipes pipes) throws Error;
 		public extern void _resume_spawn_instance (void * instance);
 		public extern void _free_spawn_instance (void * instance);
 
-		public extern uint _do_inject (uint pid, string dylib_path, string data_string, string temp_path) throws Error;
+		public extern uint _do_inject (uint pid, string path, string entrypoint, string data, string temp_path) throws Error;
 		public extern InputStream _get_fifo_for_inject_instance (void * instance);
 		public extern void _free_inject_instance (void * instance);
 	}

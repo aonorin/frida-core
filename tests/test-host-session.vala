@@ -15,8 +15,18 @@ namespace Frida.HostSessionTest {
 			h.run ();
 		});
 
+		GLib.Test.add_func ("/HostSession/Manual/spawn-gating", () => {
+			var h = new Harness.without_timeout ((h) => Service.Manual.spawn_gating.begin (h as Harness));
+			h.run ();
+		});
+
 		GLib.Test.add_func ("/HostSession/Manual/error-feedback", () => {
 			var h = new Harness.without_timeout ((h) => Service.Manual.error_feedback.begin (h as Harness));
+			h.run ();
+		});
+
+		GLib.Test.add_func ("/HostSession/Manual/performance", () => {
+			var h = new Harness.without_timeout ((h) => Service.Manual.performance.begin (h as Harness));
 			h.run ();
 		});
 
@@ -91,6 +101,11 @@ namespace Frida.HostSessionTest {
 			h.run ();
 		});
 
+		GLib.Test.add_func ("/HostSession/Darwin/own-memory-ranges-should-be-cloaked", () => {
+			var h = new Harness ((h) => Darwin.own_memory_ranges_should_be_cloaked.begin (h as Harness));
+			h.run ();
+		});
+
 		GLib.Test.add_func ("/HostSession/Darwin/Manual/cross-arch", () => {
 			var h = new Harness ((h) => Darwin.Manual.cross_arch.begin (h as Harness));
 			h.run ();
@@ -113,6 +128,11 @@ namespace Frida.HostSessionTest {
 			h.run ();
 		});
 #endif
+
+		GLib.Test.add_func ("/HostSession/resource-leaks", () => {
+			var h = new Harness ((h) => resource_leaks.begin (h as Harness));
+			h.run ();
+		});
 
 	}
 
@@ -215,51 +235,276 @@ namespace Frida.HostSessionTest {
 				try {
 					var device_manager = new DeviceManager ();
 
-					var devices = yield device_manager.enumerate_devices ();
-					Device device = null;
-					var num_devices = devices.size ();
-					for (var i = 0; i != num_devices && device == null; i++) {
-						var d = devices.get (i);
-						if (d.dtype == DeviceType.LOCAL)
-							device = d;
-					}
-					assert (device != null);
+					var device = yield device_manager.get_device_by_type (DeviceType.LOCAL);
 
-					stdout.printf ("\n\nUsing \"%s\"\n", device.name);
+					print ("\n\nUsing \"%s\"\n", device.name);
 
-					var processes = yield device.enumerate_processes ();
-					Process process = null;
-					var num_processes = processes.size ();
-					for (var i = 0; i != num_processes && process == null; i++) {
-						var p = processes.get (i);
-						if (p.name == "re.frida.helloworld")
-							process = p;
-					}
+					var process = yield device.find_process_by_name ("Twitter");
 
 					uint pid;
 					if (process != null) {
 						pid = process.pid;
 					} else {
-						stdout.printf ("Enter PID: ");
-						stdout.flush ();
-						pid = (uint) int.parse (stdin.read_line ());
+						var raw_pid = prompt ("Enter PID:");
+						pid = (uint) int.parse (raw_pid);
 					}
 
-					stdout.printf ("Attaching to pid %u...\n", pid);
+					print ("Attaching to pid %u...\n", pid);
 					var session = yield device.attach (pid);
-					stdout.printf ("Attached!\n");
 
-					stdout.printf ("Enabling debugger...\n");
-					yield session.enable_debugger (5858);
-					stdout.printf ("Debugger listening on port 5858\n");
+					var scripts = new Gee.ArrayList<Script> ();
+					var done = false;
 
-					while (true)
+					new Thread<bool> ("input-worker", () => {
+						while (true) {
+							print (
+								"1. Add script\n" +
+								"2. Load script\n" +
+								"3. Remove script\n" +
+								"4. Enable debugger\n" +
+								"5. Disable debugger\n" +
+								"6. Enable JIT\n"
+							);
+
+							var command = prompt (">");
+							if (command == null)
+								break;
+							var choice = int.parse (command);
+
+							switch (choice) {
+								case 1:
+									Idle.add (() => {
+										add_script.begin (scripts, session);
+										return false;
+									});
+									break;
+								case 2:
+								case 3: {
+									var tokens = command.split(" ");
+									if (tokens.length < 2) {
+										printerr ("Missing argument\n");
+										continue;
+									}
+
+									int64 script_index;
+									if (!int64.try_parse (tokens[1], out script_index)) {
+										printerr ("Invalid script index\n");
+										continue;
+									}
+
+									Idle.add (() => {
+										if (choice == 2)
+											load_script.begin ((int) script_index, scripts);
+										else
+											remove_script.begin ((int) script_index, scripts);
+										return false;
+									});
+									break;
+								}
+								case 4:
+									Idle.add (() => {
+										enable_debugger.begin (session);
+										return false;
+									});
+									break;
+								case 5:
+									Idle.add (() => {
+										disable_debugger.begin (session);
+										return false;
+									});
+									break;
+								case 6:
+									Idle.add (() => {
+										enable_jit.begin (session);
+										return false;
+									});
+									break;
+								default:
+									break;
+							}
+						}
+
+						print ("\n\n");
+
+						Idle.add (() => {
+							done = true;
+							return false;
+						});
+
+						return true;
+					});
+
+					while (!done)
 						yield h.process_events ();
+
+					h.done ();
 				} catch (Error e) {
 					printerr ("\nFAIL: %s\n\n", e.message);
 					assert_not_reached ();
 				}
 			}
+
+			private static uint next_script_id = 1;
+
+			private static async Script? add_script (Gee.ArrayList<Script> container, Session session) {
+				Script script;
+
+				try {
+					var name = "hello%u".printf (next_script_id++);
+
+					script = yield session.create_script (name,
+						"'use strict';" +
+						"var puts = new NativeFunction(Module.findExportByName(null, 'puts'), 'int', ['pointer']);" +
+						"var i = 1;" +
+						"setInterval(function () {" +
+						"  puts(Memory.allocUtf8String('hello' + i++));" +
+						"}, 1000);");
+
+					script.message.connect ((message, data) => {
+						print ("Got message: %s\n", message);
+					});
+				} catch (Error e) {
+					printerr ("Unable to add script: %s\n", e.message);
+					return null;
+				}
+
+				container.add (script);
+
+				return script;
+			}
+
+			private static async void load_script (int index, Gee.ArrayList<Script> container) {
+				if (index < 0 || index >= container.size) {
+					printerr ("Invalid script index\n");
+					return;
+				}
+
+				var script = container[index];
+
+				try {
+					yield script.load ();
+				} catch (Error e) {
+					printerr ("Unable to remove script: %s\n", e.message);
+				}
+			}
+
+			private static async void remove_script (int index, Gee.ArrayList<Script> container) {
+				if (index < 0 || index >= container.size) {
+					printerr ("Invalid script index\n");
+					return;
+				}
+
+				var script = container.remove_at (index);
+
+				try {
+					yield script.unload ();
+				} catch (Error e) {
+					printerr ("Unable to remove script: %s\n", e.message);
+				}
+			}
+
+			private static async void enable_debugger (Session session) {
+				try {
+					yield session.enable_debugger (5858);
+				} catch (Error e) {
+					printerr ("Unable to enable debugger: %s\n", e.message);
+				}
+			}
+
+			private static async void disable_debugger (Session session) {
+				try {
+					yield session.disable_debugger ();
+				} catch (Error e) {
+					printerr ("Unable to disable debugger: %s\n", e.message);
+				}
+			}
+
+			private static async void enable_jit (Session session) {
+				try {
+					yield session.enable_jit ();
+				} catch (Error e) {
+					printerr ("Unable to enable JIT: %s\n", e.message);
+				}
+			}
+
+			private static string prompt (string message) {
+				stdout.printf ("%s ", message);
+				stdout.flush ();
+				return stdin.read_line ();
+			}
+
+			private static async void spawn_gating (Harness h) {
+				if (!GLib.Test.slow ()) {
+					stdout.printf ("<skipping, run in slow mode on an iOS or Android system> ");
+					h.done ();
+					return;
+				}
+
+				h.disable_timeout ();
+
+				try {
+					var main_loop = new MainLoop ();
+
+					var device_manager = new DeviceManager ();
+
+					var device = yield device_manager.get_device_by_type (DeviceType.LOCAL);
+					var spawned_handler = device.spawned.connect ((spawn) => {
+						print ("spawned: pid=%u identifier=%s\n", spawn.pid, spawn.identifier);
+						perform_resume.begin (device, spawn.pid);
+					});
+					var timer = new Timer ();
+					yield device.enable_spawn_gating ();
+					print ("spawn gating enabled in %u ms\n", (uint) (timer.elapsed () * 1000.0));
+
+					install_signal_handlers (main_loop);
+
+					main_loop.run ();
+
+					device.disconnect (spawned_handler);
+
+					timer.reset ();
+					yield device.disable_spawn_gating ();
+					print ("spawn gating disabled in %u ms\n", (uint) (timer.elapsed () * 1000.0));
+
+					timer.reset ();
+					yield device_manager.close ();
+					print ("manager closed in %u ms\n", (uint) (timer.elapsed () * 1000.0));
+
+					h.done ();
+				} catch (Error e) {
+					printerr ("\nFAIL: %s\n\n", e.message);
+					assert_not_reached ();
+				}
+			}
+
+			private static async void perform_resume (Device device, uint pid) {
+				try {
+					yield device.resume (pid);
+				} catch (Error e) {
+					printerr ("perform_resume(%u) failed: %s\n", pid, e.message);
+				}
+			}
+
+#if WINDOWS
+			private static void install_signal_handlers (MainLoop loop) {
+			}
+#else
+			private static MainLoop current_main_loop = null;
+
+			private static void install_signal_handlers (MainLoop loop) {
+				current_main_loop = loop;
+				Posix.signal (Posix.SIGINT, on_stop_signal);
+				Posix.signal (Posix.SIGTERM, on_stop_signal);
+			}
+
+			private static void on_stop_signal (int sig) {
+				stdout.flush ();
+				Idle.add (() => {
+					current_main_loop.quit ();
+					return false;
+				});
+			}
+#endif
 
 			private static async void error_feedback (Harness h) {
 				if (!GLib.Test.slow ()) {
@@ -271,15 +516,7 @@ namespace Frida.HostSessionTest {
 				try {
 					var device_manager = new DeviceManager ();
 
-					var devices = yield device_manager.enumerate_devices ();
-					Device device = null;
-					var num_devices = devices.size ();
-					for (var i = 0; i != num_devices && device == null; i++) {
-						var d = devices.get (i);
-						if (d.dtype == DeviceType.LOCAL)
-							device = d;
-					}
-					assert (device != null);
+					var device = yield device_manager.get_device_by_type (DeviceType.LOCAL);
 
 					stdout.printf ("\n\nEnter an absolute path that does not exist: ");
 					stdout.flush ();
@@ -357,6 +594,52 @@ namespace Frida.HostSessionTest {
 				}
 			}
 
+			private static async void performance (Harness h) {
+				if (!GLib.Test.slow ()) {
+					stdout.printf ("<skipping, run in slow mode with target application running> ");
+					h.done ();
+					return;
+				}
+
+				try {
+					var device_manager = new DeviceManager ();
+					var device = yield device_manager.get_device_by_type (DeviceType.LOCAL);
+					var process = yield device.get_process_by_name ("loop64");
+					var pid = process.pid;
+
+					var timer = new Timer ();
+
+					stdout.printf ("\n");
+					var num_iterations = 3;
+					for (var i = 0; i != num_iterations; i++) {
+						stdout.printf ("%u of %u\n", i + 1, num_iterations);
+						stdout.flush ();
+
+						timer.reset ();
+						var session = yield device.attach (pid);
+						print ("attach took %u ms\n", (uint) (timer.elapsed () * 1000.0));
+						var script = yield session.create_script ("perf", "'use strict';");
+						yield script.load ();
+
+						yield script.unload ();
+						yield session.detach ();
+
+						Timeout.add (250, () => {
+							performance.callback ();
+							return false;
+						});
+						yield;
+					}
+
+					yield device_manager.close ();
+
+					h.done ();
+				} catch (Error e) {
+					printerr ("\nFAIL: %s\n\n", e.message);
+					assert_not_reached ();
+				}
+			}
+
 			private static async void torture (Harness h) {
 				if (!GLib.Test.slow ()) {
 					stdout.printf ("<skipping, run in slow mode with target application running> ");
@@ -367,26 +650,11 @@ namespace Frida.HostSessionTest {
 				try {
 					var device_manager = new DeviceManager ();
 
-					var devices = yield device_manager.enumerate_devices ();
-					Device device = null;
-					var num_devices = devices.size ();
-					for (var i = 0; i != num_devices && device == null; i++) {
-						var d = devices.get (i);
-						if (d.dtype == DeviceType.LOCAL)
-							device = d;
-					}
-					assert (device != null);
+					var device = yield device_manager.get_device_by_type (DeviceType.LOCAL);
 
 					stdout.printf ("\n\nUsing \"%s\"\n", device.name);
 
-					var processes = yield device.enumerate_processes ();
-					Process process = null;
-					var num_processes = processes.size ();
-					for (var i = 0; i != num_processes && process == null; i++) {
-						var p = processes.get (i);
-						if (p.name == "SpringBoard")
-							process = p;
-					}
+					var process = yield device.find_process_by_name ("SpringBoard");
 
 					uint pid;
 					if (process != null) {
@@ -406,6 +674,8 @@ namespace Frida.HostSessionTest {
 						yield session.detach ();
 					}
 
+					yield device_manager.close ();
+
 					h.done ();
 				} catch (Error e) {
 					printerr ("\nFAIL: %s\n\n", e.message);
@@ -415,6 +685,50 @@ namespace Frida.HostSessionTest {
 
 		}
 
+	}
+
+	private static async void resource_leaks (Harness h) {
+		try {
+			var device_manager = new DeviceManager ();
+			var device = yield device_manager.get_device_by_type (DeviceType.LOCAL);
+			var process = Frida.Test.Process.start (Frida.Test.Labrats.path_to_executable ("sleeper"));
+
+			/* TODO: improve injectors to handle injection into a process that hasn't yet finished initializing */
+			Thread.usleep (50000);
+
+			/* Warm up static allocations */
+			var session = yield device.attach (process.id);
+			yield detach_and_wait_for_cleanup (session);
+			session = null;
+
+			var usage_before = process.snapshot_resource_usage ();
+
+			session = yield device.attach (process.id);
+			yield detach_and_wait_for_cleanup (session);
+			session = null;
+
+			var usage_after = process.snapshot_resource_usage ();
+
+			usage_after.assert_equals (usage_before);
+
+			yield device_manager.close ();
+
+			h.done ();
+		} catch (Error e) {
+			printerr ("\nFAIL: %s\n\n", e.message);
+			assert_not_reached ();
+		}
+	}
+
+	private static async void detach_and_wait_for_cleanup (Session session) throws Error {
+		yield session.detach ();
+
+		/* The Darwin injector does cleanup 50ms after detecting that the remote thread is dead */
+		Timeout.add (100, () => {
+			detach_and_wait_for_cleanup.callback ();
+			return false;
+		});
+		yield;
 	}
 
 #if LINUX
@@ -444,6 +758,7 @@ namespace Frida.HostSessionTest {
 						stdout.printf ("pid=%u name='%s'\n", process.pid, process.name);
 				}
 			} catch (GLib.Error e) {
+				printerr ("ERROR: %s\n", e.message);
 				assert_not_reached ();
 			}
 
@@ -453,7 +768,7 @@ namespace Frida.HostSessionTest {
 		}
 
 		private static async void spawn (Harness h) {
-			if ((Frida.Test.os () == Frida.Test.OS.ANDROID || Frida.Test.arch_suffix () == "-linux-arm") && !GLib.Test.slow ()) {
+			if ((Frida.Test.os () == Frida.Test.OS.ANDROID || Frida.Test.os_arch_suffix () == "-linux-arm") && !GLib.Test.slow ()) {
 				stdout.printf ("<skipping, run in slow mode> ");
 				h.done ();
 				return;
@@ -487,17 +802,16 @@ namespace Frida.HostSessionTest {
 						spawn.callback ();
 				});
 
-				var tests_dir = Path.get_dirname (Frida.Test.Process.current.filename);
-				var victim_path = Path.build_filename (tests_dir, "data", "unixvictim" + Frida.Test.arch_suffix ());
-				string[] argv = { victim_path };
+				var target_path = Frida.Test.Labrats.path_to_executable ("sleeper");
+				string[] argv = { target_path };
 				string[] envp = {};
-				pid = yield host_session.spawn (victim_path, argv, envp);
+				pid = yield host_session.spawn (target_path, argv, envp);
 
 				var session_id = yield host_session.attach_to (pid);
 				var session = yield prov.obtain_agent_session (host_session, session_id);
 
 				string received_message = null;
-				var message_handler = session.message_from_script.connect ((script_id, message, data) => {
+				var message_handler = session.message_from_script.connect ((script_id, message, has_data, data) => {
 					received_message = message;
 					if (waiting)
 						spawn.callback ();
@@ -542,7 +856,7 @@ namespace Frida.HostSessionTest {
 
 				yield host_session.kill (pid);
 			} catch (GLib.Error e) {
-				stderr.printf ("Unexpected error: %s\n", e.message);
+				printerr ("Unexpected error: %s\n", e.message);
 				assert_not_reached ();
 			}
 
@@ -577,7 +891,7 @@ namespace Frida.HostSessionTest {
 					stdout.printf ("obtain_agent_session()\n");
 					var session = yield prov.obtain_agent_session (host_session, id);
 					string received_message = null;
-					var message_handler = session.message_from_script.connect ((script_id, message, data) => {
+					var message_handler = session.message_from_script.connect ((script_id, message, has_data, data) => {
 						received_message = message;
 						spawn_android_app.callback ();
 					});
@@ -606,7 +920,7 @@ namespace Frida.HostSessionTest {
 					session.disconnect (message_handler);
 					assert (received_message == "{\"type\":\"send\",\"payload\":\"onResume\"}");
 				} catch (GLib.Error e) {
-					stderr.printf ("ERROR: %s\n", e.message);
+					printerr ("ERROR: %s\n", e.message);
 					assert_not_reached ();
 				}
 
@@ -634,7 +948,7 @@ namespace Frida.HostSessionTest {
 
 			assert (prov.name == "Local System");
 
-			if (Frida.Test.os () == Frida.Test.OS.MAC) {
+			if (Frida.Test.os () == Frida.Test.OS.MACOS) {
 				var icon = prov.icon;
 				assert (icon != null);
 				assert (icon.width == 16 && icon.height == 16);
@@ -665,16 +979,16 @@ namespace Frida.HostSessionTest {
 		}
 
 		private static async void spawn_native (Harness h) {
-			var victim_name = (Frida.Test.os () == Frida.Test.OS.MAC) ? "unixvictim-mac" : "unixvictim-ios";
-			yield run_spawn_scenario (h, victim_name);
+			var target_name = (Frida.Test.os () == Frida.Test.OS.MACOS) ? "sleeper-macos" : "sleeper-ios";
+			yield run_spawn_scenario (h, target_name);
 		}
 
 		private static async void spawn_other (Harness h) {
-			var victim_name = (Frida.Test.os () == Frida.Test.OS.MAC) ? "unixvictim-mac32" : "unixvictim-ios32";
-			yield run_spawn_scenario (h, victim_name);
+			var target_name = (Frida.Test.os () == Frida.Test.OS.MACOS) ? "sleeper-macos32" : "sleeper-ios32";
+			yield run_spawn_scenario (h, target_name);
 		}
 
-		private static async void run_spawn_scenario (Harness h, string victim_name) {
+		private static async void run_spawn_scenario (Harness h, string target_name) {
 			var backend = new DarwinHostSessionBackend ();
 			h.service.add_backend (backend);
 			yield h.service.start ();
@@ -703,17 +1017,16 @@ namespace Frida.HostSessionTest {
 						run_spawn_scenario.callback ();
 				});
 
-				var tests_dir = Path.get_dirname (Frida.Test.Process.current.filename);
-				var victim_path = Path.build_filename (tests_dir, "data", victim_name);
-				string[] argv = { victim_path };
+				var target_path = Frida.Test.Labrats.path_to_file (target_name);
+				string[] argv = { target_path };
 				string[] envp = {};
-				pid = yield host_session.spawn (victim_path, argv, envp);
+				pid = yield host_session.spawn (target_path, argv, envp);
 
 				var session_id = yield host_session.attach_to (pid);
 				var session = yield prov.obtain_agent_session (host_session, session_id);
 
 				string received_message = null;
-				var message_handler = session.message_from_script.connect ((script_id, message, data) => {
+				var message_handler = session.message_from_script.connect ((script_id, message, has_data, data) => {
 					received_message = message;
 					if (waiting)
 						run_spawn_scenario.callback ();
@@ -752,7 +1065,7 @@ namespace Frida.HostSessionTest {
 
 				yield host_session.kill (pid);
 			} catch (GLib.Error e) {
-				stderr.printf ("Unexpected error: %s\n", e.message);
+				printerr ("Unexpected error: %s\n", e.message);
 				assert_not_reached ();
 			}
 
@@ -762,16 +1075,16 @@ namespace Frida.HostSessionTest {
 		}
 
 		private static async void spawn_without_attach_native (Harness h) {
-			var victim_name = (Frida.Test.os () == Frida.Test.OS.MAC) ? "write-to-stdio-mac" : "write-to-stdio-ios";
-			yield run_spawn_scenario_with_stdio (h, victim_name);
+			var target_name = (Frida.Test.os () == Frida.Test.OS.MACOS) ? "stdio-writer-macos" : "stdio-writer-ios";
+			yield run_spawn_scenario_with_stdio (h, target_name);
 		}
 
 		private static async void spawn_without_attach_other (Harness h) {
-			var victim_name = (Frida.Test.os () == Frida.Test.OS.MAC) ? "write-to-stdio-mac32" : "write-to-stdio-ios32";
-			yield run_spawn_scenario_with_stdio (h, victim_name);
+			var target_name = (Frida.Test.os () == Frida.Test.OS.MACOS) ? "stdio-writer-macos32" : "stdio-writer-ios32";
+			yield run_spawn_scenario_with_stdio (h, target_name);
 		}
 
-		private static async void run_spawn_scenario_with_stdio (Harness h, string victim_name) {
+		private static async void run_spawn_scenario_with_stdio (Harness h, string target_name) {
 			var backend = new DarwinHostSessionBackend ();
 			h.service.add_backend (backend);
 			yield h.service.start ();
@@ -816,11 +1129,10 @@ namespace Frida.HostSessionTest {
 						run_spawn_scenario_with_stdio.callback ();
 				});
 
-				var tests_dir = Path.get_dirname (Frida.Test.Process.current.filename);
-				var victim_path = Path.build_filename (tests_dir, "data", victim_name);
-				string[] argv = { victim_path };
+				var target_path = Frida.Test.Labrats.path_to_file (target_name);
+				string[] argv = { target_path };
 				string[] envp = {};
-				pid = yield host_session.spawn (victim_path, argv, envp);
+				pid = yield host_session.spawn (target_path, argv, envp);
 
 				yield host_session.resume (pid);
 
@@ -835,13 +1147,148 @@ namespace Frida.HostSessionTest {
 
 				yield host_session.kill (pid);
 			} catch (GLib.Error e) {
-				stderr.printf ("Unexpected error: %s\n", e.message);
+				printerr ("Unexpected error: %s\n", e.message);
 				assert_not_reached ();
 			}
 
 			yield h.service.stop ();
 			h.service.remove_backend (backend);
 			h.done ();
+		}
+
+		private static async void own_memory_ranges_should_be_cloaked (Harness h) {
+			try {
+				var device_manager = new DeviceManager ();
+				var device = yield device_manager.get_device_by_type (DeviceType.LOCAL);
+				var process = Frida.Test.Process.start (Frida.Test.Labrats.path_to_executable ("sleeper"));
+
+				/* TODO: improve injector to handle injection into a process that hasn't yet finished initializing */
+				Thread.usleep (50000);
+
+				/* Warm up static allocations */
+				var session = yield device.attach (process.id);
+				yield session.detach ();
+				session = null;
+
+				/* The injector does cleanup 50ms after detecting that the remote thread is dead */
+				Timeout.add (100, () => {
+					own_memory_ranges_should_be_cloaked.callback ();
+					return false;
+				});
+				yield;
+
+				var original_ranges = dump_ranges (process.id);
+
+				session = yield device.attach (process.id);
+				var script = yield session.create_script ("dumper", """'use strict';
+var ranges = Process.enumerateRangesSync({ protection: '---', coalesce: true })
+  .map(function (range) {
+    return range.base.toString() + "-" + range.base.add(range.size).toString();
+  });
+send(ranges);
+""");
+				string received_message = null;
+				bool waiting = false;
+				script.message.connect ((message, data) => {
+					assert (received_message == null);
+					received_message = message;
+					if (waiting)
+						own_memory_ranges_should_be_cloaked.callback ();
+				});
+
+				yield script.load ();
+
+				if (received_message == null) {
+					waiting = true;
+					yield;
+					waiting = false;
+				}
+
+				var message = Json.from_string (received_message).get_object ();
+				assert (message.get_string_member ("type") == "send");
+
+				var uncloaked_ranges = new Gee.ArrayList <string> ();
+				message.get_array_member ("payload").foreach_element ((array, index, element) => {
+					var range = element.get_string ();
+					if (!original_ranges.contains (range)) {
+						uncloaked_ranges.add (range);
+					}
+				});
+
+				if (!uncloaked_ranges.is_empty) {
+					printerr ("\n\nUH-OH, uncloaked_ranges.size=%d:\n", uncloaked_ranges.size);
+					foreach (var range in uncloaked_ranges) {
+						printerr ("\t%s\n", range);
+					}
+				}
+				printerr ("\n");
+
+				// assert (uncloaked_ranges.is_empty);
+
+				yield script.unload ();
+
+				yield device_manager.close ();
+
+				h.done ();
+			} catch (GLib.Error e) {
+				printerr ("\nFAIL: %s\n\n", e.message);
+				assert_not_reached ();
+			}
+		}
+
+		private Gee.HashSet<string> dump_ranges (uint pid) {
+			var ranges = new Gee.ArrayList<Range> ();
+			var range_by_end_address = new Gee.HashMap<string, Range> ();
+
+			try {
+				string vmmap_output;
+				GLib.Process.spawn_sync (null, new string[] { "/usr/bin/vmmap", "-interleaved", "%u".printf (pid) }, null, 0, null, out vmmap_output, null, null);
+
+				var range_pattern = new Regex ("([0-9a-f]{8,})-([0-9a-f]{8,})\\s+.+\\s+([rwx-]{3})\\/");
+				MatchInfo match_info;
+				assert (range_pattern.match (vmmap_output, 0, out match_info));
+				while (match_info.matches ()) {
+					var start = uint64.parse ("0x" + match_info.fetch (1));
+					var end = uint64.parse ("0x" + match_info.fetch (2));
+					var protection = match_info.fetch (3);
+
+					var address_format = "0x%" + uint64.FORMAT_MODIFIER + "x";
+					var start_str = start.to_string (address_format);
+					var end_str = end.to_string (address_format);
+
+					Range range;
+					var existing_range = range_by_end_address[start_str];
+					if (existing_range != null && existing_range.protection == protection) {
+						existing_range.end = end_str;
+						range = existing_range;
+					} else {
+						range = new Range (start_str, end_str, protection);
+						ranges.add (range);
+					}
+					range_by_end_address[end_str] = range;
+
+					match_info.next ();
+				}
+			} catch (GLib.Error e) {
+				assert_not_reached ();
+			}
+
+			var result = new Gee.HashSet<string> ();
+			foreach (var range in ranges)
+				result.add ("%s-%s".printf (range.start, range.end));
+			return result;
+		}
+
+		private class Range {
+			public string start;
+			public string end;
+			public string protection;
+
+			public Range (string start, string end, string protection) {
+				this.start = start;
+				this.end = end;
+				this.protection = protection;
+			}
 		}
 
 		namespace Manual {
@@ -860,7 +1307,7 @@ namespace Frida.HostSessionTest {
 					GLib.Process.spawn_sync (null, new string[] { "/usr/bin/pgrep", "Safari" }, null, 0, null, out pgrep_output, null, null);
 					pid = (uint) int.parse (pgrep_output);
 				} catch (SpawnError spawn_error) {
-					stderr.printf ("ERROR: %s\n", spawn_error.message);
+					printerr ("ERROR: %s\n", spawn_error.message);
 					assert_not_reached ();
 				}
 
@@ -876,7 +1323,7 @@ namespace Frida.HostSessionTest {
 					var session = yield prov.obtain_agent_session (host_session, id);
 					string received_message = null;
 					bool waiting = false;
-					var message_handler = session.message_from_script.connect ((script_id, message, data) => {
+					var message_handler = session.message_from_script.connect ((script_id, message, has_data, data) => {
 						received_message = message;
 						if (waiting)
 							cross_arch.callback ();
@@ -891,7 +1338,7 @@ namespace Frida.HostSessionTest {
 					assert (received_message == "{\"type\":\"send\",\"payload\":\"hello\"}");
 					session.disconnect (message_handler);
 				} catch (GLib.Error e) {
-					stderr.printf ("ERROR: %s\n", e.message);
+					printerr ("ERROR: %s\n", e.message);
 					assert_not_reached ();
 				}
 
@@ -918,32 +1365,65 @@ namespace Frida.HostSessionTest {
 
 				try {
 					var host_session = yield prov.create ();
+
 					var pid = yield host_session.spawn ("com.atebits.Tweetie2", new string[] { "com.atebits.Tweetie2" }, new string[] {});
+
 					var id = yield host_session.attach_to (pid);
 					var session = yield prov.obtain_agent_session (host_session, id);
+
+					bool waiting = false;
 					string received_message = null;
-					var message_handler = session.message_from_script.connect ((script_id, message, data) => {
+					var message_handler = session.message_from_script.connect ((script_id, message, has_data, data) => {
 						received_message = message;
-						spawn_ios_app.callback ();
+						if (waiting)
+							spawn_ios_app.callback ();
 					});
+
 					var script_id = yield session.create_script ("spawn-ios-app",
-						"Interceptor.attach(Module.findExportByName('UIKit', 'UIApplicationMain'), {" +
-						"  onEnter: function (args) {" +
-						"    send('UIApplicationMain');" +
-						"  }" +
+						"Interceptor.attach(Module.findExportByName('UIKit', 'UIApplicationMain'), function () {" +
+						"  send('UIApplicationMain');" +
 						"});" +
 						"setTimeout(function () { send('ready'); }, 1);");
+
 					yield session.load_script (script_id);
-					yield;
+					if (received_message == null) {
+						waiting = true;
+						yield;
+						waiting = false;
+					}
 					assert (received_message == "{\"type\":\"send\",\"payload\":\"ready\"}");
+					received_message = null;
+
 					yield host_session.resume (pid);
-					yield;
+					if (received_message == null) {
+						waiting = true;
+						yield;
+						waiting = false;
+					}
+
 					session.disconnect (message_handler);
+
 					assert (received_message == "{\"type\":\"send\",\"payload\":\"UIApplicationMain\"}");
 				} catch (GLib.Error e) {
-					stderr.printf ("ERROR: %s\n", e.message);
-					assert_not_reached ();
+					printerr ("ERROR: %s\n", e.message);
 				}
+
+				var done = false;
+
+				new Thread<bool> ("input-worker", () => {
+					print ("Hit a key to exit\n");
+					stdin.getc ();
+
+					Idle.add (() => {
+						done = true;
+						return false;
+					});
+
+					return true;
+				});
+
+				while (!done)
+					yield h.process_events ();
 
 				yield h.service.stop ();
 				h.service.remove_backend (backend);
@@ -1023,19 +1503,16 @@ namespace Frida.HostSessionTest {
 						spawn.callback ();
 				});
 
-				var self_filename = Frida.Test.Process.current.filename;
-				var rat_directory = Path.build_filename (Path.get_dirname (Path.get_dirname (Path.get_dirname (Path.get_dirname (Path.get_dirname (self_filename))))),
-					"frida-core", "tests", "labrats");
-				var victim_path = Path.build_filename (rat_directory, "winvictim-sleepy%d.exe".printf (sizeof (void *) == 4 ? 32 : 64));
-				string[] argv = { victim_path };
+				var target_path = Frida.Test.Labrats.path_to_executable ("sleeper");
+				string[] argv = { target_path };
 				string[] envp = {};
-				pid = yield host_session.spawn (victim_path, argv, envp);
+				pid = yield host_session.spawn (target_path, argv, envp);
 
 				var session_id = yield host_session.attach_to (pid);
 				var session = yield prov.obtain_agent_session (host_session, session_id);
 
 				string received_message = null;
-				var message_handler = session.message_from_script.connect ((script_id, message, data) => {
+				var message_handler = session.message_from_script.connect ((script_id, message, has_data, data) => {
 					received_message = message;
 					if (waiting)
 						spawn.callback ();
@@ -1077,7 +1554,7 @@ namespace Frida.HostSessionTest {
 
 				yield host_session.kill (pid);
 			} catch (GLib.Error e) {
-				stderr.printf ("Unexpected error: %s\n", e.message);
+				printerr ("Unexpected error: %s\n", e.message);
 				assert_not_reached ();
 			}
 
@@ -1169,7 +1646,7 @@ namespace Frida.HostSessionTest {
 				var session_id = yield host_session.attach_to (process.pid);
 				var session = yield prov.obtain_agent_session (host_session, session_id);
 				string received_message = null;
-				var message_handler = session.message_from_script.connect ((script_id, message, data) => {
+				var message_handler = session.message_from_script.connect ((script_id, message, has_data, data) => {
 					received_message = message;
 					large_messages.callback ();
 				});
@@ -1192,7 +1669,7 @@ namespace Frida.HostSessionTest {
 						builder.append ("s");
 					}
 					builder.append ("\"");
-					yield session.post_message_to_script (script_id, builder.str);
+					yield session.post_to_script (script_id, builder.str, false, new uint8[0]);
 					yield;
 					stdout.printf ("received message: '%s'\n", received_message);
 				}

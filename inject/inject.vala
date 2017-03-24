@@ -2,14 +2,14 @@ namespace Frida.Inject {
 	private static Application application;
 
 	private static bool output_version;
-	private static bool disable_jit;
+	private static bool enable_jit;
 	private static bool enable_development;
 	private static int pid;
 	private static string script_file;
 
 	const OptionEntry[] options = {
 		{ "version", 0, 0, OptionArg.NONE, ref output_version, "Output version information and exit", null },
-		{ "disable-jit", 0, 0, OptionArg.NONE, ref disable_jit, "Disable the JIT runtime", null },
+		{ "enable-jit", 0, 0, OptionArg.NONE, ref enable_jit, "Enable the JIT runtime", null },
 		{ "development", 'D', 0, OptionArg.NONE, ref enable_development, "Enable development mode", null },
 		{ "pid", 'p', 0, OptionArg.INT, ref pid, null, "PID" },
 		{ "script", 's', 0, OptionArg.FILENAME, ref script_file, null, "JAVASCRIPT_FILENAME" },
@@ -64,7 +64,7 @@ namespace Frida.Inject {
 #endif
 
 		try {
-			application.run (pid, script_file, disable_jit, enable_development);
+			application.run (pid, script_file, enable_jit, enable_development);
 		} catch (Error e) {
 			printerr ("Unable to start: %s\n", e.message);
 			return 1;
@@ -85,17 +85,17 @@ namespace Frida.Inject {
 		private DeviceManager device_manager;
 		private int pid;
 		private string script_file;
-		private bool disable_jit;
+		private bool enable_jit;
 		private bool enable_development;
 		private ScriptRunner script_runner;
 
 		private MainLoop loop;
 		private bool stopping;
 
-		public void run (int pid, string script_file, bool disable_jit, bool enable_development) throws Error {
+		public void run (int pid, string script_file, bool enable_jit, bool enable_development) throws Error {
 			this.pid = pid;
 			this.script_file = script_file;
-			this.disable_jit = disable_jit;
+			this.enable_jit = enable_jit;
 			this.enable_development = enable_development;
 
 			Idle.add (() => {
@@ -109,23 +109,12 @@ namespace Frida.Inject {
 
 		private async void start () throws Error {
 			device_manager = new DeviceManager ();
-			var device_list = yield device_manager.enumerate_devices ();
 
-			Device device = null;
-			for (int i = 0; i != device_list.size (); i++) {
-				Device current_device = device_list.get (i);
-				if (current_device.dtype == DeviceType.LOCAL) {
-					device = current_device;
-					break;
-				}
-			}
-
-			if (device == null)
-				throw new Error.INVALID_OPERATION ("Couldn't find the local backend\n");
+			var device = yield device_manager.get_device_by_type (DeviceType.LOCAL);
 
 			var session = yield device.attach (pid);
 
-			var r = new ScriptRunner (session, script_file, disable_jit, enable_development);
+			var r = new ScriptRunner (session, script_file, enable_jit, enable_development);
 			try {
 				yield r.start ();
 				script_runner = r;
@@ -164,7 +153,7 @@ namespace Frida.Inject {
 	private class ScriptRunner : Object {
 		private Script script;
 		private string script_file;
-		private FileMonitor script_monitor;
+		private GLib.FileMonitor script_monitor;
 		private Source script_unchanged_timeout;
 		private Session session;
 		private bool load_in_progress = false;
@@ -173,13 +162,13 @@ namespace Frida.Inject {
 		private Gee.HashMap<string, PendingResponse> pending = new Gee.HashMap<string, PendingResponse> ();
 		private int64 next_request_id = 1;
 
-		public ScriptRunner (Session session, string script_file, bool disable_jit, bool enable_development) {
+		public ScriptRunner (Session session, string script_file, bool enable_jit, bool enable_development) {
 			this.session = session;
 			this.script_file = script_file;
 			this.enable_development = enable_development;
 
-			if (disable_jit)
-				session.disable_jit.begin ();
+			if (enable_jit)
+				session.enable_jit.begin ();
 		}
 
 		public async void start () throws Error {
@@ -299,7 +288,7 @@ namespace Frida.Inject {
 
 		private async void post_call_request (string request, PendingResponse response) {
 			try {
-				yield script.post_message (request);
+				yield script.post (request);
 			} catch (GLib.Error e) {
 				response.complete_with_error (Marshal.from_dbus (e));
 			}
@@ -323,7 +312,7 @@ namespace Frida.Inject {
 			script_unchanged_timeout = source;
 		}
 
-		private void on_message (string raw_message, uint8[] data) {
+		private void on_message (string raw_message, Bytes? data) {
 			var parser = new Json.Parser ();
 			try {
 				parser.load_from_data (raw_message);

@@ -113,10 +113,14 @@ namespace Winjector {
 				context = start_services (Service.derive_basename (), level);
 
 				yield helper32.start ();
-				if (System.is_x64 ())
-					yield helper64.start ();
+				helper32.proxy.uninjected.connect (on_uninjected);
 
-				connection = yield DBusConnection.new (new Pipe (parent_address), null, DBusConnectionFlags.DELAY_MESSAGE_PROCESSING);
+				if (System.is_x64 ()) {
+					yield helper64.start ();
+					helper64.proxy.uninjected.connect (on_uninjected);
+				}
+
+				connection = yield new DBusConnection (new Pipe (parent_address), null, DBusConnectionFlags.DELAY_MESSAGE_PROCESSING);
 				connection.closed.connect (on_connection_closed);
 				WinjectorHelper helper = this;
 				registration_id = connection.register_object (WinjectorObjectPath.HELPER, helper);
@@ -146,12 +150,12 @@ namespace Winjector {
 			});
 		}
 
-		public async void inject (uint pid, string filename_template, string data_string) throws Frida.Error {
+		public async uint inject_library_file (uint pid, string path_template, string entrypoint, string data) throws Frida.Error {
 			try {
 				if (Process.is_x64 (pid))
-					yield helper64.proxy.inject (pid, filename_template.printf (64), data_string);
+					return yield helper64.proxy.inject_library_file (pid, path_template.printf (64), entrypoint, data);
 				else
-					yield helper32.proxy.inject (pid, filename_template.printf (32), data_string);
+					return yield helper32.proxy.inject_library_file (pid, path_template.printf (32), entrypoint, data);
 			} catch (GLib.Error e) {
 				throw Marshal.from_dbus (e);
 			}
@@ -159,6 +163,10 @@ namespace Winjector {
 
 		private void on_connection_closed (DBusConnection connection, bool remote_peer_vanished, GLib.Error? error) {
 			stop.begin ();
+		}
+
+		private void on_uninjected (uint id) {
+			uninjected (id);
 		}
 
 		private class HelperService {
@@ -182,7 +190,7 @@ namespace Winjector {
 
 			public async void start () throws Frida.Error {
 				try {
-					connection = yield DBusConnection.new (pipe, null, DBusConnectionFlags.NONE);
+					connection = yield new DBusConnection (pipe, null, DBusConnectionFlags.NONE);
 				} catch (GLib.Error e) {
 					throw new Frida.Error.PERMISSION_DENIED (e.message);
 				}
@@ -203,7 +211,8 @@ namespace Winjector {
 		private DBusConnection connection;
 		private uint registration_id;
 
-		private Gee.HashMap<uint32, void *> thread_handle_by_pid = new Gee.HashMap<uint32, void *> ();
+		private uint next_id = 0;
+		private uint pending = 0;
 
 		public Service () {
 			Idle.add (() => {
@@ -218,7 +227,8 @@ namespace Winjector {
 
 		private async void start () {
 			try {
-				connection = yield DBusConnection.new (new Pipe ("pipe:role=client,name=" + derive_svcname_for_self ()), null, DBusConnectionFlags.DELAY_MESSAGE_PROCESSING);
+				connection = yield new DBusConnection (new Pipe ("pipe:role=client,name=" + derive_svcname_for_self ()), null, DBusConnectionFlags.DELAY_MESSAGE_PROCESSING);
+				connection.closed.connect (on_connection_closed);
 				WinjectorHelper helper = this;
 				registration_id = connection.register_object (WinjectorObjectPath.HELPER, helper);
 				connection.start_message_processing ();
@@ -237,38 +247,51 @@ namespace Winjector {
 
 		private async void do_stop () throws Frida.Error {
 			connection.unregister_object (registration_id);
+			connection.closed.disconnect (on_connection_closed);
 			try {
 				yield connection.close ();
 			} catch (GLib.Error connection_error) {
 			}
-			connection = null;
 
-			shutdown ();
+			if (pending == 0)
+				shutdown ();
 		}
 
-		public async void inject (uint pid, string filename, string data_string) throws Frida.Error {
-			for (int i = 0; thread_handle_by_pid.has_key (pid) && i != 40; i++) {
-				Timeout.add (50, () => {
-					inject.callback ();
-					return false;
-				});
-				yield;
+		public async uint inject_library_file (uint pid, string path, string entrypoint, string data) throws Frida.Error {
+			if (next_id == 0 || next_id >= int.MAX) {
+				/* Avoid ID collisions when running one helper for 32-bit and one for 64-bit targets */
+				next_id = (sizeof (void *) == 4) ? 1 : 2;
 			}
+			var id = next_id;
+			next_id += 2;
 
-			if (thread_handle_by_pid.has_key (pid))
-				throw new Frida.Error.TIMED_OUT ("Unexpectedly timed out while waiting for existing agent to unload");
-
-			var waitable_thread_handle = Process.inject (pid, filename, data_string);
+			void * instance, waitable_thread_handle;
+			Process.inject_library_file (pid, path, entrypoint, data, out instance, out waitable_thread_handle);
 			if (waitable_thread_handle != null) {
-				thread_handle_by_pid[pid] = waitable_thread_handle;
-
+				pending++;
 				var source = WaitHandleSource.create (waitable_thread_handle, true);
 				source.set_callback (() => {
-					thread_handle_by_pid.unset (pid);
+					bool is_resident;
+					Process.free_inject_instance (instance, out is_resident);
+
+					if (!is_resident)
+						uninjected (id);
+
+					pending--;
+					if (connection.is_closed () && pending == 0)
+						shutdown ();
+
 					return false;
 				});
 				source.attach (MainContext.default ());
 			}
+
+			return id;
+		}
+
+		private void on_connection_closed (bool remote_peer_vanished, GLib.Error? error) {
+			if (pending == 0)
+				shutdown ();
 		}
 
 		public static extern string derive_basename ();
@@ -309,8 +332,9 @@ namespace Winjector {
 	}
 
 	namespace Process {
-		public static extern bool is_x64 (uint32 process_id);
-		public static extern void * inject (uint32 process_id, string dll_path, string ipc_server_address) throws Frida.Error;
+		public static extern bool is_x64 (uint32 pid);
+		public static extern void inject_library_file (uint32 pid, string path, string entrypoint, string data, out void * inject_instance, out void * waitable_thread_handle) throws Frida.Error;
+		public static extern void free_inject_instance (void * inject_instance, out bool is_resident);
 	}
 
 	namespace WaitHandleSource {

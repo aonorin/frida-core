@@ -105,6 +105,9 @@
     <None Include="src\host-session-service.vala">
       <Filter>Source Files</Filter>
     </None>
+    <None Include="src\debugger.vala">
+      <Filter>Source Files</Filter>
+    </None>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="$(IntDir)src\host-session-service.c">
@@ -159,6 +162,9 @@
       <Filter>Source Files\generated\fruity</Filter>
     </ClCompile>
     <ClCompile Include="$(IntDir)src\frida.c">
+      <Filter>Source Files\generated\core</Filter>
+    </ClCompile>
+    <ClCompile Include="$(IntDir)src\debugger.c">
       <Filter>Source Files\generated\core</Filter>
     </ClCompile>
     <ClCompile Include="$(IntDir)src\windows\winjector-types.c">

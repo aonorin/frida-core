@@ -114,7 +114,7 @@ namespace Frida {
 		public signal void host_session_closed (HostSession session);
 
 		public abstract async AgentSession obtain_agent_session (HostSession host_session, AgentSessionId agent_session_id) throws Error;
-		public signal void agent_session_closed (AgentSessionId id);
+		public signal void agent_session_closed (AgentSessionId id, SessionDetachReason reason);
 	}
 
 	public enum HostSessionProviderKind {
@@ -133,11 +133,13 @@ namespace Frida {
 
 	public abstract class BaseDBusHostSession : Object, HostSession {
 		public signal void agent_session_opened (AgentSessionId id, AgentSession session);
-		public signal void agent_session_closed (AgentSessionId id, AgentSession session);
+		public signal void agent_session_closed (AgentSessionId id, AgentSession session, SessionDetachReason reason);
 
 		private Gee.HashMap<uint, Gee.Promise<Entry>> entries = new Gee.HashMap<uint, Gee.Promise<Entry>> ();
 		private Gee.HashMap<uint, AgentSession> sessions = new Gee.HashMap<uint, AgentSession> ();
 		private uint next_session_id = 1;
+
+		protected Injector injector;
 
 		public virtual async void close () {
 			while (!entries.is_empty) {
@@ -146,8 +148,7 @@ namespace Frida {
 				var request = iterator.get ();
 				try {
 					var entry = yield request.future.wait_async ();
-					entries.unset (entry.pid);
-					yield entry.close ();
+					yield destroy (entry, SessionDetachReason.APPLICATION_REQUESTED);
 				} catch (Gee.FutureError e) {
 				}
 			}
@@ -187,10 +188,9 @@ namespace Frida {
 			} catch (GLib.Error e) {
 				/*
 				 * We might be attempting to open a new session on an agent that is about to unload,
-				 * so if we fail here wait 2 milliseconds and consider re-establishing. We typically
-				 * get on_connection_closed within 300-500 microseconds.
+				 * so if we fail here wait a bit and consider re-establishing.
 				 */
-				var timeout_source = new TimeoutSource (2);
+				var timeout_source = new TimeoutSource (10);
 				timeout_source.set_callback (() => {
 					attach_to.callback ();
 					return false;
@@ -259,7 +259,7 @@ namespace Frida {
 					timeout_source.attach (MainContext.get_thread_default ());
 
 					try {
-						connection = yield DBusConnection.new (stream, null, DBusConnectionFlags.NONE, null, cancellable);
+						connection = yield new DBusConnection (stream, null, DBusConnectionFlags.NONE, null, cancellable);
 						provider = yield connection.get_proxy (null, ObjectPath.AGENT_SESSION_PROVIDER, DBusProxyFlags.NONE, cancellable);
 					} catch (GLib.Error establish_error) {
 						if (establish_error is IOError.CANCELLED)
@@ -318,7 +318,7 @@ namespace Frida {
 			}
 			assert (entry_to_remove != null);
 
-			destroy (entry_to_remove);
+			destroy.begin (entry_to_remove, SessionDetachReason.PROCESS_TERMINATED);
 		}
 
 		private void on_session_closed (AgentSessionId id) {
@@ -327,7 +327,7 @@ namespace Frida {
 			AgentSession session;
 			var found = sessions.unset (raw_id, out session);
 			assert (found);
-			agent_session_closed (id, session);
+			agent_session_closed (id, session, SessionDetachReason.APPLICATION_REQUESTED);
 			agent_session_destroyed (id);
 
 			foreach (var promise in entries.values) {
@@ -348,13 +348,14 @@ namespace Frida {
 			}
 		}
 
-		private void destroy (Entry entry) {
+		private async void destroy (Entry entry, SessionDetachReason reason) {
+			if (!entries.unset (entry.pid))
+				return;
+
 			entry.provider.closed.disconnect (on_session_closed);
 			entry.connection.closed.disconnect (on_connection_closed);
 
-			entries.unset (entry.pid);
-
-			entry.close.begin ();
+			yield entry.close ();
 
 			foreach (var raw_id in entry.sessions) {
 				var id = AgentSessionId (raw_id);
@@ -363,7 +364,7 @@ namespace Frida {
 				var found = sessions.unset (raw_id, out session);
 				assert (found);
 
-				agent_session_closed (id, session);
+				agent_session_closed (id, session, reason);
 				agent_session_destroyed (id);
 			}
 		}
@@ -426,6 +427,17 @@ namespace Frida {
 
 				close_request.set_value (true);
 			}
+		}
+
+		public async InjectorPayloadId inject_library_file (uint pid, string path, string entrypoint, string data) throws Error {
+			var raw_id = yield injector.inject_library_file (pid, path, entrypoint, data);
+			return InjectorPayloadId (raw_id);
+		}
+
+		public async InjectorPayloadId inject_library_blob (uint pid, uint8[] blob, string entrypoint, string data) throws Error {
+			var blob_bytes = new Bytes (blob);
+			var raw_id = yield injector.inject_library_blob (pid, blob_bytes, entrypoint, data);
+			return InjectorPayloadId (raw_id);
 		}
 	}
 }

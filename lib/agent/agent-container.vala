@@ -7,7 +7,7 @@ namespace Frida {
 
 		private Module module;
 		[CCode (has_target = false)]
-		private delegate void AgentMainFunc (string data_string, Gum.MemoryRange? mapped_range, Gum.ThreadId parent_thread_id);
+		private delegate void AgentMainFunc (string data, Gum.MemoryRange? mapped_range, Gum.ThreadId parent_thread_id);
 		private AgentMainFunc main_impl;
 		private PipeTransport transport;
 		private Thread<bool> thread;
@@ -37,7 +37,7 @@ namespace Frida {
 			DBusConnection connection;
 			AgentSessionProvider provider;
 			try {
-				connection = yield DBusConnection.new (new Pipe (transport.local_address), null, DBusConnectionFlags.NONE);
+				connection = yield new DBusConnection (new Pipe (transport.local_address), null, DBusConnectionFlags.NONE);
 				provider = yield connection.get_proxy (null, ObjectPath.AGENT_SESSION_PROVIDER);
 				provider.opened.connect (container.on_session_opened);
 				provider.closed.connect (container.on_session_closed);

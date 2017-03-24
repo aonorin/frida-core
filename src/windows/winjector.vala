@@ -1,6 +1,6 @@
 #if WINDOWS
 namespace Frida {
-	public class Winjector : Object {
+	public class Winjector : Object, Injector {
 		public ResourceStore normal_resource_store {
 			get {
 				if (_normal_resource_store == null) {
@@ -9,13 +9,11 @@ namespace Frida {
 					} catch (Error e) {
 						assert_not_reached ();
 					}
-					normal_helper_factory.resource_store = _normal_resource_store;
 				}
 				return _normal_resource_store;
 			}
 		}
 		private ResourceStore _normal_resource_store;
-		private HelperFactory normal_helper_factory = new HelperFactory (PrivilegeLevel.NORMAL);
 
 		public ResourceStore elevated_resource_store {
 			get {
@@ -25,30 +23,57 @@ namespace Frida {
 					} catch (Error e) {
 						assert_not_reached ();
 					}
-					elevated_helper_factory.resource_store = _elevated_resource_store;
 				}
 				return _elevated_resource_store;
 			}
 		}
 		private ResourceStore _elevated_resource_store;
-		private HelperFactory elevated_helper_factory = new HelperFactory (PrivilegeLevel.ELEVATED);
+
+		private HelperFactory normal_helper_factory {
+			get {
+				if (_normal_helper_factory.resource_store == null)
+					_normal_helper_factory.resource_store = normal_resource_store;
+				return _normal_helper_factory;
+			}
+		}
+		private HelperFactory _normal_helper_factory = new HelperFactory (PrivilegeLevel.NORMAL);
+
+		private HelperFactory elevated_helper_factory {
+			get {
+				if (_elevated_helper_factory.resource_store == null)
+					_elevated_helper_factory.resource_store = elevated_resource_store;
+				return _elevated_helper_factory;
+			}
+		}
+		private HelperFactory _elevated_helper_factory = new HelperFactory (PrivilegeLevel.ELEVATED);
+
+		private Gee.HashMap<uint, uint> pid_by_id = new Gee.HashMap<uint, uint> ();
+		private Gee.HashMap<uint, TemporaryFile> blob_file_by_id = new Gee.HashMap<uint, TemporaryFile> ();
+		private uint next_blob_id = 1;
+
+		construct {
+			_normal_helper_factory.uninjected.connect (on_uninjected);
+			_elevated_helper_factory.uninjected.connect (on_uninjected);
+		}
 
 		public async void close () {
-			yield normal_helper_factory.close ();
-			yield elevated_helper_factory.close ();
+			_normal_helper_factory.uninjected.disconnect (on_uninjected);
+			_elevated_helper_factory.uninjected.disconnect (on_uninjected);
+
+			yield _normal_helper_factory.close ();
+			yield _elevated_helper_factory.close ();
 
 			_normal_resource_store = null;
 			_elevated_resource_store = null;
 		}
 
-		public async void inject (uint pid, AgentDescriptor desc, string data_string) throws Error {
-			var filename = normal_resource_store.ensure_copy_of (desc);
-
-			bool injected = false;
+		public async uint inject_library_file (uint pid, string path, string entrypoint, string data) throws Error {
+			uint id = 0;
 
 			var normal_helper = yield normal_helper_factory.obtain ();
+			bool injected = false;
 			try {
-				yield normal_helper.inject (pid, filename, data_string);
+				id = yield normal_helper.inject_library_file (pid, path, entrypoint, data);
 				injected = true;
 			} catch (Error inject_error) {
 				if (!(inject_error is Error.PERMISSION_DENIED))
@@ -56,7 +81,38 @@ namespace Frida {
 			}
 
 			if (!injected) {
-				filename = elevated_resource_store.ensure_copy_of (desc);
+				HelperInstance elevated_helper;
+				try {
+					elevated_helper = yield elevated_helper_factory.obtain ();
+				} catch (Error elevate_error) {
+					throw new Error.PERMISSION_DENIED ("Unable to access process with pid %u from the current user account".printf (pid));
+				}
+				id = yield elevated_helper.inject_library_file (pid, path, entrypoint, data);
+			}
+
+			pid_by_id[id] = pid;
+
+			return id;
+		}
+
+		public async uint inject_library_blob (uint pid, Bytes blob, string entrypoint, string data) throws Error {
+			uint id = 0;
+
+			var name = "blob%u.dll".printf (next_blob_id++);
+			var file = new TemporaryFile.from_stream (name, new MemoryInputStream.from_bytes (blob), normal_resource_store.tempdir);
+
+			var normal_helper = yield normal_helper_factory.obtain ();
+			bool injected = false;
+			try {
+				id = yield normal_helper.inject_library_file (pid, file.path, entrypoint, data);
+				injected = true;
+			} catch (Error inject_error) {
+				if (!(inject_error is Error.PERMISSION_DENIED))
+					throw inject_error;
+			}
+
+			if (!injected) {
+				file = new TemporaryFile.from_stream (name, new MemoryInputStream.from_bytes (blob), elevated_resource_store.tempdir);
 
 				HelperInstance elevated_helper;
 				try {
@@ -64,11 +120,65 @@ namespace Frida {
 				} catch (Error elevate_error) {
 					throw new Error.PERMISSION_DENIED ("Unable to access process with pid %u from the current user account".printf (pid));
 				}
-				yield elevated_helper.inject (pid, filename, data_string);
+				id = yield elevated_helper.inject_library_file (pid, file.path, entrypoint, data);
 			}
+
+			pid_by_id[id] = pid;
+			blob_file_by_id[id] = file;
+
+			return id;
+		}
+
+		public async uint inject_library_resource (uint pid, AgentDescriptor resource, string entrypoint, string data) throws Error {
+			uint id = 0;
+
+			var path = normal_resource_store.ensure_copy_of (resource);
+
+			var normal_helper = yield normal_helper_factory.obtain ();
+			bool injected = false;
+			try {
+				id = yield normal_helper.inject_library_file (pid, path, entrypoint, data);
+				injected = true;
+			} catch (Error inject_error) {
+				if (!(inject_error is Error.PERMISSION_DENIED))
+					throw inject_error;
+			}
+
+			if (!injected) {
+				path = elevated_resource_store.ensure_copy_of (resource);
+
+				HelperInstance elevated_helper;
+				try {
+					elevated_helper = yield elevated_helper_factory.obtain ();
+				} catch (Error elevate_error) {
+					throw new Error.PERMISSION_DENIED ("Unable to access process with pid %u from the current user account".printf (pid));
+				}
+				id = yield elevated_helper.inject_library_file (pid, path, entrypoint, data);
+			}
+
+			pid_by_id[id] = pid;
+
+			return id;
+		}
+
+		public bool any_still_injected () {
+			return !pid_by_id.is_empty;
+		}
+
+		public bool is_still_injected (uint id) {
+			return pid_by_id.has_key (id);
+		}
+
+		private void on_uninjected (uint id) {
+			pid_by_id.unset (id);
+			blob_file_by_id.unset (id);
+
+			uninjected (id);
 		}
 
 		private class HelperInstance {
+			public signal void uninjected (uint id);
+
 			private TemporaryFile helper32;
 			private TemporaryFile helper64;
 			private PipeTransport transport;
@@ -92,7 +202,7 @@ namespace Frida {
 
 			public async void open () throws Error {
 				try {
-					connection = yield DBusConnection.new (pipe, null, DBusConnectionFlags.NONE);
+					connection = yield new DBusConnection (pipe, null, DBusConnectionFlags.NONE);
 				} catch (GLib.Error e) {
 					throw new Error.PERMISSION_DENIED (e.message);
 				}
@@ -102,9 +212,13 @@ namespace Frida {
 				} catch (IOError e) {
 					throw new Error.PROTOCOL (e.message);
 				}
+
+				proxy.uninjected.connect (on_uninjected);
 			}
 
 			public async void close () {
+				proxy.uninjected.disconnect (on_uninjected);
+
 				try {
 					yield proxy.stop ();
 				} catch (GLib.Error e) {
@@ -135,12 +249,16 @@ namespace Frida {
 				yield;
 			}
 
-			public async void inject (uint pid, string filename_template, string data_string) throws Error {
+			public async uint inject_library_file (uint pid, string path_template, string entrypoint, string data) throws Error {
 				try {
-					yield proxy.inject (pid, filename_template, data_string);
+					return yield proxy.inject_library_file (pid, path_template, entrypoint, data);
 				} catch (GLib.Error e) {
 					throw Marshal.from_dbus (e);
 				}
+			}
+
+			private void on_uninjected (uint id) {
+				uninjected (id);
 			}
 
 			private static extern bool is_process_still_running (void * handle);
@@ -153,12 +271,14 @@ namespace Frida {
 		}
 
 		private class HelperFactory {
+			public signal void uninjected (uint id);
+
 			private PrivilegeLevel level;
 			private MainContext main_context;
 			private HelperInstance helper;
 			private Gee.ArrayList<ObtainRequest> obtain_requests = new Gee.ArrayList<ObtainRequest> ();
 
-			public ResourceStore resource_store {
+			public ResourceStore? resource_store {
 				get;
 				set;
 			}
@@ -170,6 +290,8 @@ namespace Frida {
 
 			public async void close () {
 				if (helper != null) {
+					helper.uninjected.disconnect (on_uninjected);
+
 					yield helper.close ();
 					helper = null;
 				}
@@ -232,10 +354,15 @@ namespace Frida {
 				}
 
 				this.helper = completed_instance;
+				this.helper.uninjected.connect (on_uninjected);
 
 				foreach (var request in obtain_requests)
 					request.complete (completed_instance, completed_error);
 				obtain_requests.clear ();
+			}
+
+			private void on_uninjected (uint id) {
+				uninjected (id);
 			}
 
 			private class ObtainRequest {
@@ -266,8 +393,12 @@ namespace Frida {
 		}
 
 		public class ResourceStore {
-			private TemporaryDirectory tempdir;
 			private static extern void set_acls_as_needed (string path) throws Error;
+
+			public TemporaryDirectory tempdir {
+				get;
+				private set;
+			}
 
 			public TemporaryFile helper32 {
 				get;
@@ -366,10 +497,6 @@ namespace Frida {
 				reset_stream (_dll32);
 				return _dll32;
 			}
-
-			construct {
-				_dll32 = value;
-			}
 		}
 		private InputStream _dll32;
 
@@ -377,10 +504,6 @@ namespace Frida {
 			get {
 				reset_stream (_dll64);
 				return _dll64;
-			}
-
-			construct {
-				_dll64 = value;
 			}
 		}
 		private InputStream _dll64;
@@ -391,14 +514,19 @@ namespace Frida {
 		}
 
 		public AgentDescriptor (string name_template, InputStream dll32, InputStream dll64) {
-			AgentDescriptor.with_resources (name_template, dll32, dll64, new AgentResource[] {});
+			Object (name_template: name_template);
+
+			this._dll32 = dll32;
+			this._dll64 = dll64;
+
+			this.resources = new AgentResource[] {};
 		}
 
 		public AgentDescriptor.with_resources (string name_template, InputStream dll32, InputStream dll64, AgentResource[] resources) {
-			Object (name_template: name_template, dll32: dll32, dll64: dll64);
+			Object (name_template: name_template);
 
-			assert (dll32 is Seekable);
-			assert (dll64 is Seekable);
+			this._dll32 = dll32;
+			this._dll64 = dll64;
 
 			this.resources = resources;
 		}
@@ -423,17 +551,13 @@ namespace Frida {
 				reset_stream (_data);
 				return _data;
 			}
-
-			construct {
-				_data = value;
-			}
 		}
 		private InputStream _data;
 
 		public AgentResource (string name, InputStream data) {
-			Object (name: name, data: data);
+			Object (name: name);
 
-			assert (data is Seekable);
+			_data = data;
 		}
 
 		private void reset_stream (InputStream stream) {

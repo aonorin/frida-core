@@ -33,9 +33,10 @@ check: all
 	cp "$(top_builddir)/lib/agent/.libs/libfrida-agent.so" "$(top_builddir)/lib/agent/.libs/libfrida-agent.so.stripped"
 	$$STRIP --strip-all "$(top_builddir)/lib/agent/.libs/libfrida-agent.so.stripped"
 	adb push "$(top_builddir)/lib/agent/.libs/libfrida-agent.so.stripped" "${RPFX}/lib/frida/libfrida-agent.so"
-	adb push "$(top_builddir)/tests/data/unixvictim-android-i386" "${RPFX}/tests/data/unixvictim-android-i386"
-	adb push "$(top_builddir)/tests/data/unixattacker-android-i386.so" "${RPFX}/tests/data/unixattacker-android-i386.so"
-	adb shell "su -c \"${RPFX}/tests/frida-tests\""
+	adb push "$(top_builddir)/tests/data/sleeper-android-i386" "${RPFX}/tests/data/"
+	adb push "$(top_builddir)/tests/data/simple-agent-android-i386.so" "${RPFX}/tests/data/"
+	adb push "$(top_builddir)/tests/data/resident-agent-android-i386.so" "${RPFX}/tests/data/"
+	adb shell "su root \"${RPFX}/tests/frida-tests\""
 
 check-gdb: $(top_builddir)/tests/android-gdb.setup
 	adb shell "${RM} -f /data/local/tmp/tests/debug-socket"
@@ -57,9 +58,10 @@ check: all
 	cp "$(top_builddir)/lib/agent/.libs/libfrida-agent.so" "$(top_builddir)/lib/agent/.libs/libfrida-agent.so.stripped"
 	$$STRIP --strip-all "$(top_builddir)/lib/agent/.libs/libfrida-agent.so.stripped"
 	adb push "$(top_builddir)/lib/agent/.libs/libfrida-agent.so.stripped" "${RPFX}/lib/frida/libfrida-agent.so"
-	adb push "$(top_builddir)/tests/data/unixvictim-android-arm" "${RPFX}/tests/data/unixvictim-android-arm"
-	adb push "$(top_builddir)/tests/data/unixattacker-android-arm.so" "${RPFX}/tests/data/unixattacker-android-arm.so"
-	adb shell "su -c \"${RPFX}/tests/frida-tests\""
+	adb push "$(top_builddir)/tests/data/sleeper-android-arm" "${RPFX}/tests/data/"
+	adb push $(top_builddir)/tests/data/simple-agent-android-arm.so "${RPFX}/tests/data/"
+	adb push $(top_builddir)/tests/data/resident-agent-android-arm.so "${RPFX}/tests/data/"
+	adb shell "su root \"${RPFX}/tests/frida-tests\""
 
 check-gdb: $(top_builddir)/tests/android-gdb.setup
 	adb shell "${RM} -f /data/local/tmp/tests/debug-socket"
@@ -81,9 +83,10 @@ check: all
 	cp "$(top_builddir)/lib/agent/.libs/libfrida-agent.so" "$(top_builddir)/lib/agent/.libs/libfrida-agent.so.stripped"
 	$$STRIP --strip-all "$(top_builddir)/lib/agent/.libs/libfrida-agent.so.stripped"
 	adb push "$(top_builddir)/lib/agent/.libs/libfrida-agent.so.stripped" "${RPFX}/lib/frida/libfrida-agent.so"
-	adb push "$(top_builddir)/tests/data/unixvictim-android-arm64" "${RPFX}/tests/data/unixvictim-android-arm64"
-	adb push "$(top_builddir)/tests/data/unixattacker-android-arm64.so" "${RPFX}/tests/data/unixattacker-android-arm64.so"
-	adb shell "su -c \"${RPFX}/tests/frida-tests\""
+	adb push "$(top_builddir)/tests/data/sleeper-android-arm64" "${RPFX}/tests/data/"
+	adb push $(top_builddir)/tests/data/simple-agent-android-arm64.so "${RPFX}/tests/data/"
+	adb push $(top_builddir)/tests/data/resident-agent-android-arm64.so "${RPFX}/tests/data/"
+	adb shell "su root \"${RPFX}/tests/frida-tests\""
 
 check-gdb: $(top_builddir)/tests/android-gdb.setup
 	adb shell "${RM} -f /data/local/tmp/tests/debug-socket"

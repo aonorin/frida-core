@@ -5,7 +5,9 @@
 #include <sys/wait.h>
 #ifdef HAVE_DARWIN
 # include <mach-o/dyld.h>
+# include <signal.h>
 # include <spawn.h>
+# include <sys/types.h>
 #endif
 
 #ifdef HAVE_QNX
@@ -84,7 +86,7 @@ frida_test_process_backend_filename_of (void * handle)
 #ifdef HAVE_QNX
   g_assert (handle == &frida_magic_self_handle);
 
-  struct dlopen_handle ** _handle = dlopen (NULL, RTLD_NOW);
+  struct dlopen_handle ** _handle = dlopen (NULL, RTLD_LAZY);
   struct dlopen_handle * p_u = *(_handle);
 
   return g_strdup (p_u->p_lm->l_path);
@@ -108,9 +110,9 @@ frida_test_process_backend_self_id (void)
 }
 
 void
-frida_test_process_backend_do_start (const char * path, gchar ** argv,
+frida_test_process_backend_create (const char * path, gchar ** argv,
     int argv_length, gchar ** envp, int envp_length, FridaTestArch arch,
-    void ** handle, guint * id, GError ** error)
+    gboolean suspended, void ** handle, guint * id, GError ** error)
 {
   const gchar * override = g_getenv ("FRIDA_TARGET_PID");
   if (override != NULL)
@@ -131,7 +133,8 @@ frida_test_process_backend_do_start (const char * path, gchar ** argv,
     posix_spawnattr_init (&attr);
     sigemptyset (&signal_mask_set);
     posix_spawnattr_setsigmask (&attr, &signal_mask_set);
-    posix_spawnattr_setflags (&attr, POSIX_SPAWN_SETSIGMASK);
+    posix_spawnattr_setflags (&attr, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_CLOEXEC_DEFAULT |
+        (suspended ? POSIX_SPAWN_START_SUSPENDED : 0));
 
 # if defined (HAVE_I386) && GLIB_SIZEOF_VOID_P == 4
     pref = (arch == FRIDA_TEST_ARCH_CURRENT) ? CPU_TYPE_X86 : CPU_TYPE_X86_64;
@@ -226,7 +229,7 @@ frida_test_process_backend_do_start (const char * path, gchar ** argv,
 }
 
 int
-frida_test_process_backend_do_join (void * handle, guint timeout_msec,
+frida_test_process_backend_join (void * handle, guint timeout_msec,
     GError ** error)
 {
   int status = -1;
@@ -335,6 +338,31 @@ frida_test_process_backend_do_join (void * handle, guint timeout_msec,
 #endif
 
   return status;
+}
+
+void
+frida_test_process_backend_resume (void * handle, GError ** error)
+{
+#ifdef HAVE_DARWIN
+  kill (GPOINTER_TO_SIZE (handle), SIGCONT);
+#else
+  (void) handle;
+
+  g_set_error (error,
+      FRIDA_ERROR,
+      FRIDA_ERROR_NOT_SUPPORTED,
+      "Not implemented on this OS");
+#endif
+}
+
+void
+frida_test_process_backend_kill (void * handle)
+{
+#ifdef HAVE_DARWIN
+  kill (GPOINTER_TO_SIZE (handle), SIGKILL);
+#else
+  g_object_unref (handle);
+#endif
 }
 
 #ifndef HAVE_DARWIN
